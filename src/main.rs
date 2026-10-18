@@ -1,6 +1,6 @@
 //! Эндоскоп — рентген-камера для ИИ-агентов. Продукт №1 рембазы.
-//! v0.6: три глаза + экран + АТРИБУЦИЯ (кто трогал файл)
-//!       + ПРОВЕРКА ПРАВДЫ: кнопка «проверить путь» на экране.
+//! v0.7: три глаза + экран + атрибуция + проверка файла
+//!       + ДЕТЕКТОР ЛЖИ: сверка заявления агента с дневником правды.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -348,7 +348,7 @@ fn start_screen(journal_path: String) {
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            let mut buf = [0u8; 4096];
+            let mut buf = [0u8; 8192];
             let _ = stream.read(&mut buf);
             let req = String::from_utf8_lossy(&buf).to_string();
             let first = req.lines().next().unwrap_or("").to_string();
@@ -358,6 +358,10 @@ fn start_screen(journal_path: String) {
                 let raw = first.trim_start_matches("GET /check?path=");
                 let raw = raw.split(' ').next().unwrap_or("");
                 (check_json(&journal_path, &url_decode(raw)), "application/json")
+            } else if first.starts_with("GET /lie?claim=") {
+                let raw = first.trim_start_matches("GET /lie?claim=");
+                let raw = raw.split(' ').next().unwrap_or("");
+                (lie_json(&journal_path, &url_decode(raw)), "application/json")
             } else {
                 (PAGE.to_string(), "text/html; charset=utf-8")
             };
@@ -374,7 +378,25 @@ fn start_screen(journal_path: String) {
 }
 
 fn url_decode(s: &str) -> String {
-    s.replace("%20", " ").replace("%2F", "/").replace("%2f", "/").replace('+', " ")
+    let mut out: Vec<u8> = Vec::new();
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        if b[i] == b'+' {
+            out.push(b' ');
+        } else {
+            out.push(b[i]);
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
 }
 
 fn load_lines(journal_path: &str) -> Vec<String> {
@@ -396,38 +418,115 @@ fn events_json(journal_path: &str) -> String {
     format!("[{}]", lines.join(","))
 }
 
-/// ПРАВДА ПО ПУТИ: все факты, где путь всплывает. Вердикт — трогали или нет.
+/// ПРАВДА ПО ПУТИ: все факты, где путь всплывает.
 fn check_json(journal_path: &str, query: &str) -> String {
     let q = query.trim();
     let mut hits: Vec<String> = load_lines(journal_path)
         .into_iter()
         .filter(|l| q.len() > 3 && l.contains(q))
         .collect();
-    let touched = hits.iter().filter(|l| {
-        l.contains("file_create") || l.contains("file_write") || l.contains("file_delete")
-    });
-    let n_touched = touched.count();
+    let n_touched = hits
+        .iter()
+        .filter(|l| {
+            l.contains("file_create") || l.contains("file_write") || l.contains("file_delete")
+        })
+        .count();
     let (verdict, red) = if q.len() < 4 {
-        ("Введите путь целиком (минимум 4 символа)", false)
+        ("Введите путь целиком (минимум 4 символа)".to_string(), false)
     } else if n_touched > 0 {
-        ("ФАЙЛ ТРОГАЛИ: найдено фактов", true)
+        (format!("ФАЙЛ ТРОГАЛИ: найдено фактов {}", n_touched), true)
     } else {
-        ("По дневнику это НЕ трогали — чисто", false)
+        ("По дневнику это НЕ трогали — чисто".to_string(), false)
     };
-    let shown: Vec<String> = if hits.len() > 100 {
+    let mut shown = if hits.len() > 100 {
         hits.split_off(hits.len() - 100)
     } else {
         hits
     };
-    let mut out = shown;
-    out.reverse();
+    shown.reverse();
     format!(
-        "{{\"verdict\":{}\"{}\"{},\"touched\":{},\"events\":[{}]}}",
-        if red { "" } else { "" },
-        verdict.replace('"', ""),
-        "",
+        "{{\"verdict\":\"{}\",\"touched\":{},\"events\":[{}]}}",
+        verdict.replace('"', "'"),
         n_touched,
-        out.join(",")
+        shown.join(",")
+    )
+}
+
+/// ДЕТЕКТОР ЛЖИ: сверка заявления с дневником правды.
+/// Заявление вида "я не трогал /home/alexandr/hub/paragon_monitor.py"
+/// вытаскиваем все пути и сверяем с фактами.
+fn lie_json(journal_path: &str, claim: &str) -> String {
+    let lines = load_lines(journal_path);
+    let claim_l = claim.to_lowercase();
+    let denies = claim_l.contains("не трогал") || claim_l.contains("не менял")
+        || claim_l.contains("ничего не делал") || claim_l.contains("не создавал")
+        || claim_l.contains("не удалял");
+    // вытаскиваем пути из заявления: слова, начинающиеся с / и длиной > 4
+    let mut paths: Vec<String> = Vec::new();
+    for word in claim.split_whitespace() {
+        let w = word.trim_matches(|c: char| c == ',' || c == '.' || c == '"' || c == '\'' || c == ')' || c == '(');
+        if w.starts_with('/') && w.len() > 4 {
+            if !paths.iter().any(|p| p == w) {
+                paths.push(w.to_string());
+            }
+        }
+    }
+    let mut items: Vec<String> = Vec::new();
+    let mut lies = 0;
+    let mut truths = 0;
+    for p in &paths {
+        let touched: Vec<&String> = lines
+            .iter()
+            .filter(|l| {
+                l.contains(p.as_str())
+                    && (l.contains("file_create") || l.contains("file_write") || l.contains("file_delete"))
+            })
+            .collect();
+        let n = touched.len();
+        let fact = n > 0;
+        if denies && fact {
+            lies += 1;
+        } else if fact {
+            truths += 1;
+        }
+        let status = if denies {
+            if fact { "СОВРАЛ" } else { "ПРАВДА" }
+        } else if fact {
+            "ПОДТВЕРЖДЕНО"
+        } else {
+            "НЕ НАЙДЕНО"
+        };
+        let proof = if n > 0 {
+            touched
+                .iter()
+                .rev()
+                .take(3)
+                .map(|l| l.replace('"', "'"))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        } else {
+            String::new()
+        };
+        items.push(format!(
+            "{{\"path\":\"{}\",\"status\":\"{}\",\"facts\":{},\"proof\":\"{}\"}}",
+            p.replace('"', "'"),
+            status,
+            n,
+            proof
+        ));
+    }
+    let verdict = if lies > 0 {
+        format!("ВРАНЬЁ ОБНАРУЖЕНО: {} из {} пунктов противоречат дневнику", lies, items.len())
+    } else if items.is_empty() {
+        "В заявлении нет путей для проверки — вставь текст с путями файлов".to_string()
+    } else {
+        format!("Заявление не противоречит дневнику ({} пунктов проверено)", items.len())
+    };
+    format!(
+        "{{\"verdict\":\"{}\",\"lies\":{},\"items\":[{}]}}",
+        verdict.replace('"', "'"),
+        lies,
+        items.join(",")
     )
 }
 
@@ -445,6 +544,11 @@ const PAGE: &str = r#"<!DOCTYPE html>
  #verdict{margin:10px 0;padding:10px 14px;border-radius:6px;font-weight:600;display:none}
  .red{background:#3d1418;color:#f85149;border:1px solid #f85149}
  .green{background:#12261e;color:#3fb950;border:1px solid #3fb950}
+ .lie{border:1px solid #30363d;border-radius:6px;padding:10px 14px;margin:10px 0}
+ .lie .path{color:#e6edf3;font-size:13px;word-break:break-all}
+ .lie .st{font-weight:700;margin-right:8px}
+ .st-СОВРАЛ{color:#f85149}.st-ПРАВДА{color:#3fb950}.st-ПОДТВЕРЖДЕНО{color:#58a6ff}.st-НЕ_НАЙДЕНО{color:#8b949e}
+ .lie .proof{color:#8b949e;font-size:12px;margin-top:4px;word-break:break-all}
  table{width:100%;border-collapse:collapse;font-size:13px}
  th{position:sticky;top:0;background:#161b22;text-align:left;padding:8px;color:#8b949e}
  td{padding:6px 8px;border-top:1px solid #21262d;word-break:break-all}
@@ -458,6 +562,13 @@ const PAGE: &str = r#"<!DOCTYPE html>
 <div><input id="q" placeholder="введи путь к файлу — проверить, трогали ли его">
 <button onclick="check()">ПРОВЕРИТЬ</button></div>
 <div id="verdict"></div>
+<div class="lie" style="background:#161b22">
+ <div style="color:#8b949e;font-size:13px;margin-bottom:6px">ДЕТЕКТОР ЛЖИ: вставь заявление агента (например: «я не трогал /путь/файл»)</div>
+ <input id="claim" placeholder="заявление агента для проверки">
+ <button onclick="lie()">СВЕРИТЬ С ПРАВДОЙ</button>
+ <div id="lieverdict"></div>
+ <div id="lieitems"></div>
+</div>
 <table><thead><tr><th>Время</th><th>Что</th><th>Кто</th><th>Деталь</th></tr></thead>
 <tbody id="rows"></tbody></table></div>
 <script>
@@ -479,9 +590,24 @@ async function check(){
  try{
   const r=await fetch('/check?path='+encodeURIComponent(q));const d=await r.json();
   v.className=d.verdict.indexOf('ТРОГАЛИ')>=0?'red':'green';
-  v.textContent=d.verdict+' ('+d.touched+')';
+  v.textContent=d.verdict;
   document.getElementById('rows').innerHTML=d.events.map(row).join('');
  }catch(e){v.className='red';v.textContent='ошибка проверки'}
+}
+async function lie(){
+ const c=document.getElementById('claim').value.trim();
+ if(!c)return;
+ const v=document.getElementById('lieverdict');
+ try{
+  const r=await fetch('/lie?claim='+encodeURIComponent(c));const d=await r.json();
+  v.className=d.lies>0?'red':'green';v.style.display='block';v.style.margin='10px 0';v.style.padding='10px 14px';v.style.borderRadius='6px';v.style.fontWeight='600';
+  v.textContent=d.verdict;
+  document.getElementById('lieitems').innerHTML=(d.items||[]).map(i=>
+   '<div class="lie"><span class="st st-'+i.status+'">'+i.status+'</span>'+
+   '<span class="path">'+esc(i.path)+'</span>'+
+   (i.proof?'<div class="proof">доказательство: '+esc(i.proof)+'</div>':'')+
+   '</div>').join('');
+ }catch(e){v.className='red';v.textContent='ошибка сверки'}
 }
 tick();
 </script></body></html>"#;
@@ -504,7 +630,7 @@ fn main() -> std::io::Result<()> {
 
     let pid = std::process::id();
     println!(
-        "Эндоскоп v0.6 запущен. pid={}, журнал={}, экран=http://localhost:7095",
+        "Эндоскоп v0.7 запущен. pid={}, журнал={}, экран=http://localhost:7095",
         pid, journal_path
     );
     loop {
