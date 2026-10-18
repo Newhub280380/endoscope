@@ -1,10 +1,11 @@
 //! Эндоскоп — рентген-камера для ИИ-агентов. Продукт №1 рембазы.
-//! v0.3: журнал правды JSONL + пульс + глаз №1 (запуски) + глаз №2 (сеть).
+//! v0.4: журнал правды + пульс + глаз №1 (запуски) + глаз №2 (сеть) + глаз №3 (файлы).
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -118,7 +119,6 @@ fn decode_addr(hex: &str) -> String {
 
 /// Глаз №2: живые сетевые соединения — кто с кем разговаривает.
 fn scan_net(seen_conn: &mut HashSet<(u32, u64)>, journal: &mut Journal) {
-    // карта сокет-inode -> pid
     let mut inode_pid: HashMap<u64, u32> = HashMap::new();
     if let Ok(entries) = std::fs::read_dir("/proc") {
         for e in entries.flatten() {
@@ -172,26 +172,128 @@ fn scan_net(seen_conn: &mut HashSet<(u32, u64)>, journal: &mut Journal) {
     }
 }
 
+/// Глаз №3: файлы. Слежение за ключевыми рабочими папками.
+/// Кто создал / переписал / удалил файл — факт в журнал.
+const WATCH_DIRS: &[&str] = &[
+    "/home/alexandr/pc-agent",
+    "/home/alexandr/hub",
+    "/home/alexandr/kb",
+    "/home/alexandr/endoscope/src",
+    "/home/alexandr/spynel/.spynel/instructions",
+];
+
+fn scan_files(state: &mut HashMap<PathBuf, (u64, u64)>, journal: &mut Journal) {
+    for dir in WATCH_DIRS {
+        walk_dir(Path::new(dir), 3, state, journal);
+    }
+}
+
+fn walk_dir(dir: &Path, depth: u32, state: &mut HashMap<PathBuf, (u64, u64)>, journal: &mut Journal) {
+    if depth == 0 {
+        return;
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let mut names: Vec<PathBuf> = Vec::new();
+    for e in entries.flatten() {
+        names.push(e.path());
+    }
+    // Удалённое: было в состоянии, исчезло с диска.
+    let on_disk: HashSet<PathBuf> = names.iter().cloned().collect();
+    let vanished: Vec<PathBuf> = state
+        .keys()
+        .filter(|p| p.parent() == Some(dir) && !on_disk.contains(*p))
+        .cloned()
+        .collect();
+    for p in vanished {
+        state.remove(&p);
+        let ev = Event::now("file_delete", 0, "unknown", p.display().to_string());
+        let _ = journal.write_event(&ev);
+    }
+    for path in names {
+        if is_noise(&path) {
+            continue;
+        }
+        let meta = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if meta.is_dir() {
+            walk_dir(&path, depth - 1, state, journal);
+            continue;
+        }
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let size = meta.len();
+        let old = state.get(&path).copied();
+        match old {
+            None => {
+                state.insert(path.clone(), (mtime, size));
+                let ev = Event::now("file_create", 0, "unknown", path.display().to_string());
+                let _ = journal.write_event(&ev);
+            }
+            Some((old_mtime, old_size)) => {
+                if old_mtime != mtime {
+                    state.insert(path.clone(), (mtime, size));
+                    let detail = format!(
+                        "{} (было {} байт, стало {} байт)",
+                        path.display(),
+                        old_size,
+                        size
+                    );
+                    let ev = Event::now("file_write", 0, "unknown", detail);
+                    let _ = journal.write_event(&ev);
+                }
+            }
+        }
+    }
+}
+
+/// Мусор, который не пишем: кэши, сборка, git-внутренности.
+fn is_noise(p: &Path) -> bool {
+    let s = p.to_string_lossy();
+    s.contains("/target/")
+        || s.contains("/.git/")
+        || s.contains("/node_modules/")
+        || s.contains("/__pycache__/")
+        || s.contains("/.venv/")
+        || s.ends_with(".pyc")
+        || s.contains("/.spynel/history")
+        || s.contains("/.spynel/tasks/")
+        || s.contains("/.spynel/goals/")
+        || s.contains("/.spynel/jobs/")
+        || s.contains("/.spynel/runtime/")
+}
+
 fn main() -> std::io::Result<()> {
     let journal_path = std::env::var("ENDOSCOPE_JOURNAL")
         .unwrap_or_else(|_| "endoscope.jsonl".into());
     let mut journal = Journal::open(&journal_path)?;
     let mut seen: HashSet<u32> = HashSet::new();
     let mut seen_conn: HashSet<(u32, u64)> = HashSet::new();
+    let mut file_state: HashMap<PathBuf, (u64, u64)> = HashMap::new();
 
     // Первый проход — фиксируем тех, кто уже живёт.
     scan_procs(&mut seen, &mut journal);
     scan_net(&mut seen_conn, &mut journal);
+    scan_files(&mut file_state, &mut journal);
 
     let pid = std::process::id();
     println!(
-        "Эндоскоп v0.3 запущен. pid={}, журнал={}",
+        "Эндоскоп v0.4 запущен. pid={}, журнал={}",
         pid, journal_path
     );
     loop {
         let before = journal.count;
         scan_procs(&mut seen, &mut journal);
         scan_net(&mut seen_conn, &mut journal);
+        scan_files(&mut file_state, &mut journal);
         let new_events = journal.count - before;
         let ev = Event::now("heartbeat", pid, "endoscope", "alive".into());
         journal.write_event(&ev)?;
