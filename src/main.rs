@@ -1,14 +1,21 @@
 //! Эндоскоп — рентген-камера для ИИ-агентов. Продукт №1 рембазы.
-//! v0.5: журнал правды + пульс + глаз №1 (запуски) + глаз №2 (сеть)
-//!       + глаз №3 (файлы) + ЭКРАН «кино» (веб-табло на порту 7095).
+//! v0.6: три глаза + экран + АТРИБУЦИЯ (кто трогал файл)
+//!       + ПРОВЕРКА ПРАВДЫ: кнопка «проверить путь» на экране.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Event {
@@ -21,16 +28,7 @@ struct Event {
 
 impl Event {
     fn now(kind: &str, pid: u32, agent: &str, detail: String) -> Self {
-        Self {
-            ts: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0),
-            kind: kind.into(),
-            pid,
-            agent: agent.into(),
-            detail,
-        }
+        Self { ts: now_ms(), kind: kind.into(), pid, agent: agent.into(), detail }
     }
 }
 
@@ -74,8 +72,11 @@ fn pid_cmdline(pid: u32) -> String {
         .to_string()
 }
 
+/// Недавние запуски — для увязки «файл тронули, вот кто только что запускался».
+type Spawn = (u64, u32, String, &'static str); // ts, pid, cmd, agent
+
 /// Глаз №1: каждый новый запуск в системе.
-fn scan_procs(seen: &mut HashSet<u32>, journal: &mut Journal) {
+fn scan_procs(seen: &mut HashSet<u32>, journal: &mut Journal, recent: &mut VecDeque<Spawn>) {
     if let Ok(entries) = std::fs::read_dir("/proc") {
         for e in entries.flatten() {
             let name = match e.file_name().to_str() {
@@ -95,6 +96,10 @@ fn scan_procs(seen: &mut HashSet<u32>, journal: &mut Journal) {
                 continue;
             }
             let agent = classify(&cmd);
+            recent.push_back((now_ms(), pid, cmd.chars().take(200).collect(), agent));
+            while recent.len() > 100 {
+                recent.pop_front();
+            }
             let ev = Event::now("spawn", pid, agent, cmd.chars().take(200).collect());
             let _ = journal.write_event(&ev);
         }
@@ -183,13 +188,69 @@ const WATCH_DIRS: &[&str] = &[
     "/home/alexandr/spynel/.spynel/instructions",
 ];
 
-fn scan_files(state: &mut HashMap<PathBuf, (u64, u64)>, journal: &mut Journal) {
+/// КТО виновник: ищем живой процесс, у которого этот файл открыт прямо сейчас.
+fn attribute_open(path_str: &str) -> Option<(u32, &'static str)> {
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for e in entries.flatten() {
+            let name = match e.file_name().to_str() {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+            let pid: u32 = match name.parse() {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if let Ok(fds) = std::fs::read_dir(format!("/proc/{}/fd", pid)) {
+                for fd in fds.flatten() {
+                    if let Ok(link) = fd.path().read_link() {
+                        if link.to_string_lossy() == path_str {
+                            let cmd = pid_cmdline(pid);
+                            return Some((pid, classify(&cmd)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Запасной след: процесс, запущенный в последние 2 минуты и трогавший эту папку.
+fn correlate_recent(recent: &VecDeque<Spawn>, path_str: &str) -> Option<(u32, &'static str)> {
+    let parent = Path::new(path_str)
+        .parent()
+        .and_then(|p| p.to_str())
+        .unwrap_or("");
+    let parent = parent.rsplit('/').next().unwrap_or("");
+    if parent.is_empty() {
+        return None;
+    }
+    let now = now_ms();
+    for (ts, pid, cmd, agent) in recent.iter().rev() {
+        if now.saturating_sub(*ts) < 120_000 && cmd.contains(parent) {
+            return Some((*pid, agent));
+        }
+    }
+    None
+}
+
+fn scan_files(
+    state: &mut HashMap<PathBuf, (u64, u64)>,
+    journal: &mut Journal,
+    recent: &VecDeque<Spawn>,
+) {
     for dir in WATCH_DIRS {
-        walk_dir(Path::new(dir), 3, state, journal);
+        walk_dir(Path::new(dir), 3, state, journal, recent);
     }
 }
 
-fn walk_dir(dir: &Path, depth: u32, state: &mut HashMap<PathBuf, (u64, u64)>, journal: &mut Journal) {
+fn walk_dir(
+    dir: &Path,
+    depth: u32,
+    state: &mut HashMap<PathBuf, (u64, u64)>,
+    journal: &mut Journal,
+    recent: &VecDeque<Spawn>,
+) {
     if depth == 0 {
         return;
     }
@@ -221,7 +282,7 @@ fn walk_dir(dir: &Path, depth: u32, state: &mut HashMap<PathBuf, (u64, u64)>, jo
             Err(_) => continue,
         };
         if meta.is_dir() {
-            walk_dir(&path, depth - 1, state, journal);
+            walk_dir(&path, depth - 1, state, journal, recent);
             continue;
         }
         let mtime = meta
@@ -231,23 +292,23 @@ fn walk_dir(dir: &Path, depth: u32, state: &mut HashMap<PathBuf, (u64, u64)>, jo
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         let size = meta.len();
+        let ps = path.display().to_string();
         let old = state.get(&path).copied();
         match old {
             None => {
                 state.insert(path.clone(), (mtime, size));
-                let ev = Event::now("file_create", 0, "unknown", path.display().to_string());
+                let (pid, agent) =
+                    attribute_open(&ps).or_else(|| correlate_recent(recent, &ps)).unwrap_or((0, "unknown"));
+                let ev = Event::now("file_create", pid, agent, ps);
                 let _ = journal.write_event(&ev);
             }
             Some((old_mtime, old_size)) => {
                 if old_mtime != mtime {
                     state.insert(path.clone(), (mtime, size));
-                    let detail = format!(
-                        "{} (было {} байт, стало {} байт)",
-                        path.display(),
-                        old_size,
-                        size
-                    );
-                    let ev = Event::now("file_write", 0, "unknown", detail);
+                    let (pid, agent) =
+                        attribute_open(&ps).or_else(|| correlate_recent(recent, &ps)).unwrap_or((0, "unknown"));
+                    let detail = format!("{} ({} байт -> {} байт)", ps, old_size, size);
+                    let ev = Event::now("file_write", pid, agent, detail);
                     let _ = journal.write_event(&ev);
                 }
             }
@@ -287,12 +348,16 @@ fn start_screen(journal_path: String) {
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            let mut buf = [0u8; 2048];
+            let mut buf = [0u8; 4096];
             let _ = stream.read(&mut buf);
             let req = String::from_utf8_lossy(&buf).to_string();
-            let first = req.lines().next().unwrap_or("");
-            let (body, ctype) = if first.contains("/events") {
+            let first = req.lines().next().unwrap_or("").to_string();
+            let (body, ctype) = if first.starts_with("GET /events") {
                 (events_json(&journal_path), "application/json")
+            } else if first.starts_with("GET /check?path=") {
+                let raw = first.trim_start_matches("GET /check?path=");
+                let raw = raw.split(' ').next().unwrap_or("");
+                (check_json(&journal_path, &url_decode(raw)), "application/json")
             } else {
                 (PAGE.to_string(), "text/html; charset=utf-8")
             };
@@ -308,18 +373,62 @@ fn start_screen(journal_path: String) {
     });
 }
 
+fn url_decode(s: &str) -> String {
+    s.replace("%20", " ").replace("%2F", "/").replace("%2f", "/").replace('+', " ")
+}
+
+fn load_lines(journal_path: &str) -> Vec<String> {
+    std::fs::read_to_string(journal_path)
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.to_string())
+        .filter(|l| !l.trim().is_empty() && !l.contains("\"heartbeat\""))
+        .collect()
+}
+
 /// Последние 100 фактов журнала — свежие сверху, готовым JSON-массивом.
 fn events_json(journal_path: &str) -> String {
-    let data = std::fs::read_to_string(journal_path).unwrap_or_default();
-    let mut lines: Vec<&str> = data
-        .lines()
-        .filter(|l| !l.trim().is_empty() && !l.contains("heartbeat"))
-        .collect();
+    let mut lines = load_lines(journal_path);
     if lines.len() > 100 {
         lines = lines.split_off(lines.len() - 100);
     }
     lines.reverse();
     format!("[{}]", lines.join(","))
+}
+
+/// ПРАВДА ПО ПУТИ: все факты, где путь всплывает. Вердикт — трогали или нет.
+fn check_json(journal_path: &str, query: &str) -> String {
+    let q = query.trim();
+    let mut hits: Vec<String> = load_lines(journal_path)
+        .into_iter()
+        .filter(|l| q.len() > 3 && l.contains(q))
+        .collect();
+    let touched = hits.iter().filter(|l| {
+        l.contains("file_create") || l.contains("file_write") || l.contains("file_delete")
+    });
+    let n_touched = touched.count();
+    let (verdict, red) = if q.len() < 4 {
+        ("Введите путь целиком (минимум 4 символа)", false)
+    } else if n_touched > 0 {
+        ("ФАЙЛ ТРОГАЛИ: найдено фактов", true)
+    } else {
+        ("По дневнику это НЕ трогали — чисто", false)
+    };
+    let shown: Vec<String> = if hits.len() > 100 {
+        hits.split_off(hits.len() - 100)
+    } else {
+        hits
+    };
+    let mut out = shown;
+    out.reverse();
+    format!(
+        "{{\"verdict\":{}\"{}\"{},\"touched\":{},\"events\":[{}]}}",
+        if red { "" } else { "" },
+        verdict.replace('"', ""),
+        "",
+        n_touched,
+        out.join(",")
+    )
 }
 
 const PAGE: &str = r#"<!DOCTYPE html>
@@ -328,9 +437,14 @@ const PAGE: &str = r#"<!DOCTYPE html>
 <style>
  body{font-family:system-ui;background:#0d1117;color:#e6edf3;margin:0;padding:20px}
  h1{font-size:22px;margin:0 0 4px}
- .sub{color:#8b949e;margin-bottom:16px;font-size:14px}
+ .sub{color:#8b949e;margin-bottom:12px;font-size:14px}
  .dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:#3fb950;margin-right:6px;animation:p 2s infinite}
  @keyframes p{50%{opacity:.3}}
+ input{background:#161b22;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:8px 12px;font-size:14px;width:70%}
+ button{background:#238636;color:#fff;border:none;border-radius:6px;padding:9px 16px;font-size:14px;cursor:pointer}
+ #verdict{margin:10px 0;padding:10px 14px;border-radius:6px;font-weight:600;display:none}
+ .red{background:#3d1418;color:#f85149;border:1px solid #f85149}
+ .green{background:#12261e;color:#3fb950;border:1px solid #3fb950}
  table{width:100%;border-collapse:collapse;font-size:13px}
  th{position:sticky;top:0;background:#161b22;text-align:left;padding:8px;color:#8b949e}
  td{padding:6px 8px;border-top:1px solid #21262d;word-break:break-all}
@@ -340,23 +454,34 @@ const PAGE: &str = r#"<!DOCTYPE html>
  #wrap{max-width:1100px;margin:0 auto}
 </style></head><body><div id="wrap">
 <h1><span class="dot"></span>ЭНДОСКОП — живая правда</h1>
-<div class="sub">Что реально делали процессы и агенты в системе. Обновление каждые 2 секунды.</div>
+<div class="sub">Что реально делали процессы и агенты. Лента обновляется каждые 2 секунды.</div>
+<div><input id="q" placeholder="введи путь к файлу — проверить, трогали ли его">
+<button onclick="check()">ПРОВЕРИТЬ</button></div>
+<div id="verdict"></div>
 <table><thead><tr><th>Время</th><th>Что</th><th>Кто</th><th>Деталь</th></tr></thead>
 <tbody id="rows"></tbody></table></div>
 <script>
 function fmt(ts){const d=new Date(ts);return d.toLocaleTimeString('ru-RU')}
 function esc(s){const d=document.createElement('div');d.textContent=s||'';return d.innerHTML}
-const RU={spawn:'запуск',connect:'связь',file_create:'файл создан',file_write:'файл переписан',file_delete:'файл удалён',heartbeat:'пульс'};
+const RU={spawn:'запуск',connect:'связь',file_create:'файл создан',file_write:'файл переписан',file_delete:'файл удалён'};
+function row(e){return '<tr><td class="time">'+fmt(e.ts)+'</td><td class="'+e.kind+'">'+(RU[e.kind]||e.kind)+'</td><td class="agent">'+esc(e.agent)+' #'+e.pid+'</td><td>'+esc(e.detail)+'</td></tr>'}
 async function tick(){
  try{
   const r=await fetch('/events');const evs=await r.json();
-  document.getElementById('rows').innerHTML=evs.map(e=>
-   '<tr><td class="time">'+fmt(e.ts)+'</td>'+
-   '<td class="'+e.kind+'">'+(RU[e.kind]||e.kind)+'</td>'+
-   '<td class="agent">'+esc(e.agent)+' #'+e.pid+'</td>'+
-   '<td>'+esc(e.detail)+'</td></tr>').join('');
+  document.getElementById('rows').innerHTML=evs.map(row).join('');
  }catch(e){}
  setTimeout(tick,2000);
+}
+async function check(){
+ const q=document.getElementById('q').value.trim();
+ if(!q)return;
+ const v=document.getElementById('verdict');v.style.display='block';
+ try{
+  const r=await fetch('/check?path='+encodeURIComponent(q));const d=await r.json();
+  v.className=d.verdict.indexOf('ТРОГАЛИ')>=0?'red':'green';
+  v.textContent=d.verdict+' ('+d.touched+')';
+  document.getElementById('rows').innerHTML=d.events.map(row).join('');
+ }catch(e){v.className='red';v.textContent='ошибка проверки'}
 }
 tick();
 </script></body></html>"#;
@@ -368,24 +493,25 @@ fn main() -> std::io::Result<()> {
     let mut seen: HashSet<u32> = HashSet::new();
     let mut seen_conn: HashSet<(u32, u64)> = HashSet::new();
     let mut file_state: HashMap<PathBuf, (u64, u64)> = HashMap::new();
+    let mut recent: VecDeque<Spawn> = VecDeque::new();
 
     start_screen(journal_path.clone());
 
     // Первый проход — фиксируем тех, кто уже живёт.
-    scan_procs(&mut seen, &mut journal);
+    scan_procs(&mut seen, &mut journal, &mut recent);
     scan_net(&mut seen_conn, &mut journal);
-    scan_files(&mut file_state, &mut journal);
+    scan_files(&mut file_state, &mut journal, &recent);
 
     let pid = std::process::id();
     println!(
-        "Эндоскоп v0.5 запущен. pid={}, журнал={}, экран=http://localhost:7095",
+        "Эндоскоп v0.6 запущен. pid={}, журнал={}, экран=http://localhost:7095",
         pid, journal_path
     );
     loop {
         let before = journal.count;
-        scan_procs(&mut seen, &mut journal);
+        scan_procs(&mut seen, &mut journal, &mut recent);
         scan_net(&mut seen_conn, &mut journal);
-        scan_files(&mut file_state, &mut journal);
+        scan_files(&mut file_state, &mut journal, &recent);
         let new_events = journal.count - before;
         let ev = Event::now("heartbeat", pid, "endoscope", "alive".into());
         journal.write_event(&ev)?;
