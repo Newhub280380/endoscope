@@ -16,7 +16,7 @@ pub mod linux;
 #[cfg(target_os = "windows")]
 pub mod windows;
 #[cfg(target_os = "windows")]
-pub mod win_handles;
+pub mod win_owner;
 
 #[cfg(target_os = "linux")]
 pub use linux::{scan_net, scan_procs, watch_dirs};

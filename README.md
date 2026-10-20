@@ -13,8 +13,8 @@
 
 Команда агента берётся из `/proc/<pid>/cmdline` на Linux и из PEB
 (`NtQueryInformationProcess`) на Windows. Кто именно держит файл открытым —
-из `/proc/<pid>/fd` на Linux и из таблицы системных дескрипторов
-(`NtQuerySystemInformation` + `DuplicateHandle`) на Windows.
+из `/proc/<pid>/fd` на Linux и через Restart Manager
+(`RmStartSession`/`RmGetList`) на Windows.
 
 ## Запуск
 

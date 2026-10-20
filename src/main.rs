@@ -16,8 +16,6 @@ fn main() -> std::io::Result<()> {
     let journal_path = std::env::var("ENDOSCOPE_JOURNAL")
         .unwrap_or_else(|_| "endoscope.jsonl".into());
     let mut journal = Journal::open(&journal_path)?;
-    #[cfg(target_os = "windows")]
-    plat::win_handles::set_journal_path(&journal_path);
     let mut seen: HashSet<u32> = HashSet::new();
     let mut seen_conn: HashSet<ConnKey> = HashSet::new();
     let mut file_state: HashMap<PathBuf, (u64, u64)> = HashMap::new();

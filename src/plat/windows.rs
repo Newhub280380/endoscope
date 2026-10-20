@@ -308,13 +308,11 @@ pub fn scan_net(seen_conn: &mut HashSet<ConnKey>, journal: &mut Journal) {
 }
 
 /// КТО виновник: ищем живой процесс, у которого этот файл открыт прямо сейчас.
-/// На Windows точный ответ даёт перебор системных дескрипторов
-/// (NtQuerySystemInformation + DuplicateHandle + GetFinalPathNameByHandleW) —
-/// см. `super::win_handles`. Если перебор недоступен, работает запасной след
-/// `correlate_recent` (недавний запуск в этой папке).
+/// На Windows это умеет Restart Manager (см. `super::win_owner`).
+/// Если процесс не найден, работает запасной след `correlate_recent`
+/// (недавний запуск в этой папке).
 pub fn attribute_open(path_str: &str) -> Option<(u32, &'static str)> {
-    let (pid, _) = super::win_handles::find_open_handle(path_str)?;
+    let (pid, _) = super::win_owner::find_open_handle(path_str)?;
     let cmd = pid_cmdline(pid);
     Some((pid, classify(&cmd)))
 }
-
