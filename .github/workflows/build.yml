@@ -1,0 +1,144 @@
+name: build
+
+# Настоящая проверка порта: сборка на живой Windows (MSVC) + дым-тест,
+# который запускает эндоскоп и ловит ложь через HTTP.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Сборка (MSVC, x64)
+        run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: endoscope-windows-x64
+          path: target/release/endoscope.exe
+      - name: Дым на живой Windows
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $root = (Get-Location).Path
+          $ev = Join-Path $root "ci-evidence"
+          New-Item -ItemType Directory -Force $ev | Out-Null
+          $watch = Join-Path $ev "watch"
+          New-Item -ItemType Directory -Force $watch | Out-Null
+          # Файл-подстава: лежит в зоне наблюдения и «не тронут» агентом.
+          $target = Join-Path $watch "секрет.txt"
+          Set-Content -Path $target -Value "секрет" -Encoding UTF8
+          # Чистый файл вне зоны наблюдения — по нему должна быть правда.
+          $clean = Join-Path $ev "чистый.txt"
+          Set-Content -Path $clean -Value "не трогали" -Encoding UTF8
+
+          $env:ENDOSCOPE_JOURNAL = Join-Path $ev "endoscope.jsonl"
+          $env:ENDOSCOPE_WATCH_DIRS = $watch
+          $exe = Join-Path $root "target\release\endoscope.exe"
+          $p = Start-Process $exe -PassThru -WindowStyle Hidden `
+                 -RedirectStandardOutput "$ev\stdout.log" -RedirectStandardError "$ev\stderr.log"
+          try {
+            # 1) экран поднялся
+            $up = $false
+            for ($i = 0; $i -lt 30; $i++) {
+              Start-Sleep -Seconds 1
+              try { $null = Invoke-WebRequest -Uri "http://127.0.0.1:7095/" -UseBasicParsing -TimeoutSec 3; $up = $true; break } catch {}
+            }
+            if (-not $up) { throw "экран :7095 не поднялся" }
+            Write-Host "OK   экран :7095 отвечает"
+
+            # 2) страница на месте
+            $page = (Invoke-WebRequest -Uri "http://127.0.0.1:7095/" -UseBasicParsing -TimeoutSec 10).Content
+            if ($page -notmatch "ЭНДОСКОП") { throw "страница без заголовка ЭНДОСКОП" }
+            Write-Host "OK   страница «кино» на месте"
+
+            # 3) живая лента фактов: должны быть запуски процессов
+            $evs = Invoke-RestMethod -Uri "http://127.0.0.1:7095/events" -TimeoutSec 10
+            if (-not $evs -or $evs.Count -lt 1) { throw "лента /events пуста" }
+            $spawns = @($evs | Where-Object { $_.kind -eq "spawn" }).Count
+            if ($spawns -lt 1) { throw "в ленте нет ни одного запуска процесса" }
+            Write-Host "OK   лента: $spawns запусков процессов, всего фактов $($evs.Count)"
+
+            # 4) ждём, пока эндоскоп увидит файл в зоне наблюдения
+            $touched = $false
+            for ($i = 0; $i -lt 20; $i++) {
+              Start-Sleep -Seconds 1
+              $c = Invoke-RestMethod -Uri ("http://127.0.0.1:7095/check?path=" + [uri]::EscapeDataString($target)) -TimeoutSec 10
+              if ($c.touched -ge 1) { $touched = $true; break }
+            }
+            if (-not $touched) { throw "файл в зоне наблюдения не зафиксирован" }
+            Write-Host "OK   файл зафиксирован: $($c.verdict)"
+
+            # 5) чистый файл — честный ответ
+            $c2 = Invoke-RestMethod -Uri ("http://127.0.0.1:7095/check?path=" + [uri]::EscapeDataString($clean)) -TimeoutSec 10
+            if ($c2.touched -ne 0) { throw "чистый файл помечен как тронутый" }
+            Write-Host "OK   чистый файл: $($c2.verdict)"
+
+            # 6) ДЕТЕКТОР ЛЖИ: агент говорит, что не трогал файл, который лежит в зоне
+            $claim = "я не трогал $target"
+            $l = Invoke-RestMethod -Uri ("http://127.0.0.1:7095/lie?claim=" + [uri]::EscapeDataString($claim)) -TimeoutSec 10
+            if ($l.lies -lt 1) { throw "детектор лжи не поймал ложь: $($l.verdict)" }
+            Write-Host "OK   ДЕТЕКТОР ЛЖИ: $($l.verdict)"
+
+            # 7) ложь по чистому файлу — правда
+            $claim2 = "я не трогал $clean"
+            $l2 = Invoke-RestMethod -Uri ("http://127.0.0.1:7095/lie?claim=" + [uri]::EscapeDataString($claim2)) -TimeoutSec 10
+            if ($l2.lies -ne 0) { throw "ложь найдена там, где её нет: $($l2.verdict)" }
+            Write-Host "OK   ДЕТЕКТОР ЛЖИ (правда): $($l2.verdict)"
+
+            # 8) в журнале есть факты по файлам
+            $jl = Get-Content $env:ENDOSCOPE_JOURNAL
+            if (-not ($jl -match "file_create")) { throw "в журнале нет событий file_create" }
+            Write-Host "OK   журнал: $($jl.Count) строк"
+          } finally {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: endoscope-windows-smoke
+          path: ci-evidence
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Сборка (Linux)
+        run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: endoscope-linux-x64
+          path: target/release/endoscope
+      - name: Дым на Linux
+        run: |
+          set -e
+          mkdir -p ci-evidence/watch
+          echo "секрет" > "ci-evidence/watch/секрет.txt"
+          echo "чисто" > ci-evidence/чистый.txt
+          export ENDOSCOPE_JOURNAL=$PWD/ci-evidence/endoscope.jsonl
+          export ENDOSCOPE_WATCH_DIRS=$PWD/ci-evidence/watch
+          ./target/release/endoscope > ci-evidence/stdout.log 2>&1 &
+          pid=$!
+          trap "kill $pid 2>/dev/null || true" EXIT
+          for i in $(seq 1 30); do
+            sleep 1
+            if curl -sf http://127.0.0.1:7095/ >/dev/null 2>&1; then break; fi
+          done
+          curl -sf http://127.0.0.1:7095/ | grep -q "ЭНДОСКОП" || { echo "страница не отдалась"; exit 1; }
+          echo "OK   страница «кино» на месте"
+          curl -sf http://127.0.0.1:7095/events | grep -q '"kind":"spawn"' || { echo "в ленте нет запусков"; exit 1; }
+          echo "OK   лента живых фактов работает"
+          for i in $(seq 1 20); do
+            sleep 1
+            t=$(curl -sf "http://127.0.0.1:7095/check?path=$PWD/ci-evidence/watch/секрет.txt" | grep -o '"touched":[0-9]*' | cut -d: -f2)
+            [ "${t:-0}" -ge 1 ] && break
+          done
+          [ "${t:-0}" -ge 1 ] || { echo "файл не зафиксирован"; exit 1; }
+          echo "OK   файл зафиксирован"
+          lies=$(curl -sf --get --data-urlencode "claim=я не трогал $PWD/ci-evidence/watch/секрет.txt" "http://127.0.0.1:7095/lie" | grep -o '"lies":[0-9]*' | cut -d: -f2)
+          [ "${lies:-0}" -ge 1 ] || { echo "детектор лжи не поймал ложь"; exit 1; }
+          echo "OK   ДЕТЕКТОР ЛЖИ поймал ложь"
