@@ -1,8 +1,26 @@
 [package]
 name = "endoscope"
-version = "0.1.0"
+version = "0.8.0"
 edition = "2021"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Windows-глаза: toolhelp32 (процессы), iphlpapi (сеть), PEB (командная строка).
+# На Linux пакет не нужен — там /proc.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Kernel",
+    "Win32_System_Threading",
+    "Wdk_System_SystemInformation",
+    "Wdk_System_Threading",
+] }
+
+[profile.release]
+opt-level = 2
