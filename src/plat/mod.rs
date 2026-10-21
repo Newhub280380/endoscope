@@ -18,10 +18,24 @@ pub mod windows;
 #[cfg(target_os = "windows")]
 pub mod win_owner;
 
+/// Процесс в живом кадре. Не событие журнала.
+pub struct ProcSnap {
+    pub pid: u32,
+    pub cmd: String,
+    pub agent: &'static str,
+}
+
+/// Слушающий TCP-порт в живом кадре.
+pub struct ListenSnap {
+    pub pid: u32,
+    pub port: u32,
+    pub local: String,
+}
+
 #[cfg(target_os = "linux")]
-pub use linux::{scan_net, scan_procs, watch_dirs};
+pub use linux::{scan_net, scan_procs, snapshot_listens, snapshot_procs, watch_dirs};
 #[cfg(target_os = "windows")]
-pub use windows::{scan_net, scan_procs, watch_dirs};
+pub use windows::{scan_net, scan_procs, snapshot_listens, snapshot_procs, watch_dirs};
 
 /// Ключ «висящего» соединения: pid + локальный адрес + локальный порт.
 /// На Linux вместо адреса кладём inode сокета — смысл тот же (идентификатор конца).

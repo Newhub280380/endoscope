@@ -76,6 +76,8 @@ pub fn start_screen(journal_path: String) {
                 let raw = first.trim_start_matches("GET /lie?claim=");
                 let raw = raw.split(' ').next().unwrap_or("");
                 (lie_json(&journal_path, &url_decode(raw)), "application/json")
+            } else if first.starts_with("GET /frame") {
+                (frame_json(&journal_path), "application/json")
             } else {
                 (PAGE.to_string(), "text/html; charset=utf-8")
             };
@@ -89,6 +91,37 @@ pub fn start_screen(journal_path: String) {
             let _ = stream.flush();
         }
     });
+}
+
+
+/// Живой кадр для XRAY: процессы и слушающие порты сейчас, плюс последние факты.
+/// Журнал не пополняется.
+pub fn frame_json(journal_path: &str) -> String {
+    let mut procs = Vec::new();
+    for p in crate::plat::snapshot_procs() {
+        procs.push(format!(
+            "{{"pid":{},"cmd":"{}","agent":"{}"}}",
+            p.pid,
+            json_escape(&p.cmd),
+            json_escape(p.agent),
+        ));
+    }
+    let mut listens = Vec::new();
+    for row in crate::plat::snapshot_listens() {
+        listens.push(format!(
+            "{{"pid":{},"port":{},"local":"{}"}}",
+            row.pid,
+            row.port,
+            json_escape(&row.local),
+        ));
+    }
+    format!(
+        "{{"ok":true,"version":"0.8.1","journal":"{}","procs":[{}],"listens":[{}],"events":{}}}",
+        json_escape(journal_path),
+        procs.join(","),
+        listens.join(","),
+        events_json(journal_path),
+    )
 }
 
 pub fn url_decode(s: &str) -> String {
