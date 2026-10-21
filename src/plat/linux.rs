@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use crate::journal::{now_ms, Event, Journal};
 
-use super::{classify, ConnKey, Spawn};
+use super::{classify, ConnKey, ListenSnap, ProcSnap, Spawn};
 
 /// Какие папки смотрим. Перекрывается переменной ENDOSCOPE_WATCH_DIRS
 /// (список через двоеточие) — так же, как на Windows.
@@ -168,4 +168,79 @@ pub fn attribute_open(path_str: &str) -> Option<(u32, &'static str)> {
         }
     }
     None
+}
+
+/// Живой кадр для XRAY: все процессы сейчас, без записи в журнал.
+pub fn snapshot_procs() -> Vec<ProcSnap> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for e in entries.flatten() {
+            let Ok(name) = e.file_name().into_string() else { continue };
+            let Ok(pid) = name.parse::<u32>() else { continue };
+            let cmd = pid_cmdline(pid);
+            if cmd.is_empty() {
+                continue;
+            }
+            out.push(ProcSnap {
+                pid,
+                cmd: cmd.chars().take(200).collect(),
+                agent: classify(&cmd),
+            });
+        }
+    }
+    out
+}
+
+fn port_of(hex: &str) -> u32 {
+    let Some((_, port)) = hex.rsplit_once(':') else { return 0 };
+    u32::from_str_radix(port, 16).unwrap_or(0)
+}
+
+fn socket_owners() -> HashMap<u64, u32> {
+    let mut inode_pid = HashMap::new();
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for e in entries.flatten() {
+            let Ok(name) = e.file_name().into_string() else { continue };
+            let Ok(pid) = name.parse::<u32>() else { continue };
+            let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else { continue };
+            for fd in fds.flatten() {
+                let Ok(link) = fd.path().read_link() else { continue };
+                let s = link.to_string_lossy();
+                let Some(rest) = s.strip_prefix("socket:[") else { continue };
+                if let Ok(ino) = rest.trim_end_matches(']').parse::<u64>() {
+                    inode_pid.insert(ino, pid);
+                }
+            }
+        }
+    }
+    inode_pid
+}
+
+/// Слушающие порты. Глаз №2 пишет только ESTABLISHED, кадру нужны LISTEN.
+pub fn snapshot_listens() -> Vec<ListenSnap> {
+    let owners = socket_owners();
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for file in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(text) = std::fs::read_to_string(file) else { continue };
+        for line in text.lines().skip(1) {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            if cols.len() < 10 || cols[3] != "0A" {
+                continue;
+            }
+            let Ok(inode) = cols[9].parse::<u64>() else { continue };
+            let pid = owners.get(&inode).copied().unwrap_or(0);
+            let port = port_of(cols[1]);
+            if port == 0 || !seen.insert((pid, port)) {
+                continue;
+            }
+            let local = if cols[1].split(':').next().map(|s| s.len()).unwrap_or(0) > 8 {
+                format!("*:{port}")
+            } else {
+                decode_addr(cols[1])
+            };
+            out.push(ListenSnap { pid, port, local });
+        }
+    }
+    out
 }

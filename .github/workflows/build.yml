@@ -50,6 +50,10 @@ jobs:
             if (-not $up) { throw "экран :7095 не поднялся" }
             Write-Host "OK   экран :7095 отвечает"
 
+            $frame = Invoke-RestMethod -Uri "http://127.0.0.1:7095/frame" -TimeoutSec 10
+            if ($null -eq $frame.procs) { throw "кадр /frame без списка процессов" }
+            Write-Host "OK   кадр /frame: $($frame.procs.Count) процессов"
+
             # 2) страница на месте
             $page = (Invoke-WebRequest -Uri "http://127.0.0.1:7095/" -UseBasicParsing -TimeoutSec 10).Content
             if ($page -notmatch "ЭНДОСКОП") { throw "страница без заголовка ЭНДОСКОП" }
@@ -129,6 +133,8 @@ jobs:
             if curl -sf http://127.0.0.1:7095/ >/dev/null 2>&1; then break; fi
           done
           curl -sf http://127.0.0.1:7095/ | grep -q "ЭНДОСКОП" || { echo "страница не отдалась"; exit 1; }
+          curl -sf http://127.0.0.1:7095/frame | grep -q '"procs"' || { echo "нет /frame"; exit 1; }
+          echo "OK   кадр /frame на месте"
           echo "OK   страница «кино» на месте"
           curl -sf http://127.0.0.1:7095/events | grep -q '"kind":"spawn"' || { echo "в ленте нет запусков"; exit 1; }
           echo "OK   лента живых фактов работает"

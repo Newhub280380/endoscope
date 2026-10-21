@@ -30,7 +30,7 @@ use windows_sys::Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasi
 
 use crate::journal::{now_ms, Event, Journal};
 
-use super::{classify, ConnKey, Spawn};
+use super::{classify, ConnKey, ListenSnap, ProcSnap, Spawn};
 
 /// `STATUS_SUCCESS`
 const STATUS_SUCCESS: i32 = 0;
@@ -224,9 +224,7 @@ pub fn scan_procs(seen: &mut HashSet<u32>, journal: &mut Journal, recent: &mut V
                 if pid != 0 && !seen.contains(&pid) {
                     seen.insert(pid);
                     let cmd = pid_cmdline(pid);
-                    if cmd.is_empty() {
-                        continue;
-                    }
+                    if !cmd.is_empty() {
                     let agent = classify(&cmd);
                     let detail: String = cmd.chars().take(200).collect();
                     recent.push_back((now_ms(), pid, detail.clone(), agent));
@@ -235,6 +233,7 @@ pub fn scan_procs(seen: &mut HashSet<u32>, journal: &mut Journal, recent: &mut V
                     }
                     let ev = Event::now("spawn", pid, agent, detail);
                     let _ = journal.write_event(&ev);
+                    }
                 }
                 if Process32NextW(snap, &mut entry) == 0 {
                     break;
@@ -315,4 +314,84 @@ pub fn attribute_open(path_str: &str) -> Option<(u32, &'static str)> {
     let (pid, _) = super::win_owner::find_open_handle(path_str)?;
     let cmd = pid_cmdline(pid);
     Some((pid, classify(&cmd)))
+}
+
+/// Живой кадр для XRAY. Не пишет журнал и не пропускает Next при пустой строке.
+pub fn snapshot_procs() -> Vec<ProcSnap> {
+    let mut out = Vec::new();
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return out;
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+        if Process32FirstW(snap, &mut entry) != 0 {
+            loop {
+                let pid = entry.th32ProcessID;
+                if pid != 0 {
+                    let cmd = pid_cmdline(pid);
+                    if !cmd.is_empty() {
+                        out.push(ProcSnap {
+                            pid,
+                            cmd: cmd.chars().take(200).collect(),
+                            agent: classify(&cmd),
+                        });
+                    }
+                }
+                if Process32NextW(snap, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snap);
+    }
+    out
+}
+
+/// Слушающие TCP. Глаз №2 оставляет только ESTABLISHED.
+pub fn snapshot_listens() -> Vec<ListenSnap> {
+    let mut out = Vec::new();
+    unsafe {
+        let mut size: u32 = 0;
+        GetExtendedTcpTable(null_mut(), &mut size, 0, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
+        if size < 4 {
+            return out;
+        }
+        let mut buf = vec![0u8; size as usize];
+        let res = GetExtendedTcpTable(
+            buf.as_mut_ptr() as *mut c_void,
+            &mut size,
+            0,
+            AF_INET,
+            TCP_TABLE_OWNER_PID_ALL,
+            0,
+        );
+        if res != 0 {
+            return out;
+        }
+        let count = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        let row_size = size_of::<TcpRowOwnerPid>();
+        let mut seen = HashSet::new();
+        for i in 0..count {
+            let off = 4 + i * row_size;
+            if off + row_size > buf.len() {
+                break;
+            }
+            let row = std::ptr::read_unaligned(buf.as_ptr().add(off) as *const TcpRowOwnerPid);
+            if row.state != 2 {
+                continue;
+            }
+            let port = u16::from_be(row.local_port as u16) as u32;
+            if port == 0 || !seen.insert((row.owning_pid, port)) {
+                continue;
+            }
+            out.push(ListenSnap {
+                pid: row.owning_pid,
+                port,
+                local: fmt_addr(row.local_addr, row.local_port),
+            });
+        }
+    }
+    out
 }
