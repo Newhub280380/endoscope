@@ -22,9 +22,15 @@ pub mod windows;
 pub mod win_owner;
 
 #[cfg(target_os = "linux")]
-pub use linux::{scan_net, scan_procs, snapshot_listens, snapshot_procs, watch_dirs, who};
+pub use linux::{
+    alive_pids, disk_free_mb, link_pids, probe_pid, scan_net, scan_procs, snapshot_listens,
+    snapshot_procs, watch_dirs, who,
+};
 #[cfg(target_os = "windows")]
-pub use windows::{scan_net, scan_procs, snapshot_listens, snapshot_procs, watch_dirs, who};
+pub use windows::{
+    alive_pids, disk_free_mb, link_pids, probe_pid, scan_net, scan_procs, snapshot_listens,
+    snapshot_procs, watch_dirs, who,
+};
 
 /// Процесс в живом кадре `/frame`. Не событие журнала.
 pub struct ProcSnap {
@@ -181,18 +187,79 @@ pub fn scan_files(
     dirs: &[PathBuf],
 ) {
     for dir in dirs {
-        walk_dir(dir, 5, state, journal, recent);
+        let root = dir.display().to_string();
+        if journal.flood_blocked(&root) {
+            continue;
+        }
+        walk_dir(dir, &root, 5, state, journal, recent);
+    }
+}
+
+/// Каталог ещё на месте и с какого тома он смотрит.
+pub fn observe_dir(path: &Path) -> crate::fdir::DirObs {
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_dir() => crate::fdir::DirObs {
+            path: path.display().to_string(),
+            present: true,
+            stamp: dir_stamp(path, &meta),
+        },
+        _ => crate::fdir::DirObs {
+            path: path.display().to_string(),
+            present: false,
+            stamp: 0,
+        },
+    }
+}
+
+fn dir_stamp(path: &Path, meta: &std::fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        let _ = path;
+        use std::os::unix::fs::MetadataExt;
+        meta.dev()
+    }
+    #[cfg(windows)]
+    {
+        let _ = meta;
+        use std::ptr::null_mut;
+        use windows_sys::Win32::Storage::FileSystem::GetVolumeInformationW;
+        let text = path.to_string_lossy();
+        let root = if text.len() >= 2 && text.as_bytes().get(1) == Some(&b':') {
+            format!("{}\\", &text[..2])
+        } else {
+            text.to_string()
+        };
+        let wide: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut serial: u32 = 0;
+        let ok = unsafe {
+            GetVolumeInformationW(
+                wide.as_ptr(),
+                null_mut(),
+                0,
+                &mut serial,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                0,
+            )
+        };
+        if ok == 0 {
+            0
+        } else {
+            serial as u64
+        }
     }
 }
 
 fn walk_dir(
     dir: &Path,
+    root: &str,
     depth: u32,
     state: &mut HashMap<PathBuf, (u64, u64)>,
     journal: &mut Journal,
     recent: &VecDeque<Spawn>,
 ) {
-    if depth == 0 {
+    if depth == 0 || journal.flood_blocked(root) {
         return;
     }
     let entries = match std::fs::read_dir(dir) {
@@ -201,6 +268,10 @@ fn walk_dir(
     };
     let mut names: Vec<PathBuf> = Vec::new();
     for e in entries.flatten() {
+        if names.len() >= crate::fdir::WALK_CAP {
+            let _ = journal.force_flood(root);
+            return;
+        }
         names.push(e.path());
     }
     let on_disk: HashSet<PathBuf> = names.iter().cloned().collect();
@@ -214,7 +285,10 @@ fn walk_dir(
         if is_noise(&p) {
             continue;
         }
-        record(journal, "file_delete", &Who::unknown(), p.display().to_string());
+                record(journal, "file_delete", &Who::unknown(), p.display().to_string());
+                if journal.flood_blocked(root) {
+                    return;
+                }
     }
     for path in names {
         if is_noise(&path) {
@@ -225,7 +299,10 @@ fn walk_dir(
             Err(_) => continue,
         };
         if meta.is_dir() {
-            walk_dir(&path, depth - 1, state, journal, recent);
+            walk_dir(&path, root, depth - 1, state, journal, recent);
+            if journal.flood_blocked(root) {
+                return;
+            }
             continue;
         }
         let mtime = meta
@@ -242,6 +319,9 @@ fn walk_dir(
                 state.insert(path.clone(), (mtime, size));
                 let who = blame(&ps, recent);
                 record(journal, "file_create", &who, ps);
+                if journal.flood_blocked(root) {
+                    return;
+                }
             }
             Some((old_mtime, old_size)) => {
                 if old_mtime != mtime {
@@ -249,6 +329,9 @@ fn walk_dir(
                     let who = blame(&ps, recent);
                     let detail = format!("{} ({} байт -> {} байт)", ps, old_size, size);
                     record(journal, "file_write", &who, detail);
+                    if journal.flood_blocked(root) {
+                        return;
+                    }
                 }
             }
         }

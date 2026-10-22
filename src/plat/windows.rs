@@ -416,3 +416,114 @@ pub fn snapshot_listens() -> Vec<ListenSnap> {
     }
     out
 }
+
+pub fn alive_pids() -> HashSet<u32> {
+    let mut out = HashSet::new();
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return out;
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+        if Process32FirstW(snap, &mut entry) != 0 {
+            loop {
+                if entry.th32ProcessID != 0 {
+                    out.insert(entry.th32ProcessID);
+                }
+                if Process32NextW(snap, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snap);
+    }
+    out
+}
+
+pub fn link_pids(watch: &[u32]) -> HashSet<u32> {
+    let owners = tcp_owner_pids();
+    watch.iter().copied().filter(|pid| owners.contains(pid)).collect()
+}
+
+fn tcp_owner_pids() -> HashSet<u32> {
+    let mut out = HashSet::new();
+    unsafe {
+        let mut size: u32 = 0;
+        GetExtendedTcpTable(null_mut(), &mut size, 0, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
+        if size < 4 {
+            return out;
+        }
+        let mut buf = vec![0u8; size as usize];
+        let res = GetExtendedTcpTable(
+            buf.as_mut_ptr() as *mut c_void,
+            &mut size,
+            0,
+            AF_INET,
+            TCP_TABLE_OWNER_PID_ALL,
+            0,
+        );
+        if res != 0 {
+            return out;
+        }
+        let count = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        let row_size = size_of::<TcpRowOwnerPid>();
+        for i in 0..count {
+            let off = 4 + i * row_size;
+            if off + row_size > buf.len() {
+                break;
+            }
+            let row = std::ptr::read_unaligned(buf.as_ptr().add(off) as *const TcpRowOwnerPid);
+            if row.state == TCP_STATE_ESTABLISHED && row.owning_pid != 0 {
+                out.insert(row.owning_pid);
+            }
+        }
+    }
+    out
+}
+
+pub fn probe_pid(pid: u32) -> Option<crate::precursor::Probe> {
+    let mut threads = None;
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+        if Process32FirstW(snap, &mut entry) != 0 {
+            loop {
+                if entry.th32ProcessID == pid {
+                    threads = Some(entry.cntThreads as u64);
+                    break;
+                }
+                if Process32NextW(snap, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snap);
+    }
+    threads.map(|threads| crate::precursor::Probe {
+        rss_kb: None,
+        handles: None,
+        threads: Some(threads),
+        cpu_ms: None,
+    })
+}
+
+pub fn disk_free_mb(path: &std::path::Path) -> Option<u64> {
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let wide: Vec<u16> = path
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut free: u64 = 0;
+    let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, null_mut(), null_mut()) };
+    if ok == 0 {
+        None
+    } else {
+        Some(free / (1024 * 1024))
+    }
+}
