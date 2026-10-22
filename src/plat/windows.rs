@@ -13,7 +13,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::ffi::c_void;
 use std::mem::size_of;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::ptr::null_mut;
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
@@ -28,9 +28,9 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation};
 
-use crate::journal::{now_ms, Event, Journal};
+use crate::journal::{now_ms, Journal};
 
-use super::{classify, ConnKey, Spawn};
+use super::{record, ConnKey, ProcSnap, ListenSnap, Spawn, Who};
 
 /// `STATUS_SUCCESS`
 const STATUS_SUCCESS: i32 = 0;
@@ -64,7 +64,7 @@ struct TcpRowOwnerPid {
 }
 
 /// Какие папки смотрим. Перекрывается переменной ENDOSCOPE_WATCH_DIRS
-/// (список через точку с запятой) — так же, как на Linux.
+/// (список через точку с запятой). По умолчанию — `C:\remote` и профиль.
 pub fn watch_dirs() -> Vec<PathBuf> {
     if let Ok(custom) = std::env::var("ENDOSCOPE_WATCH_DIRS") {
         let v: Vec<PathBuf> = custom
@@ -76,48 +76,67 @@ pub fn watch_dirs() -> Vec<PathBuf> {
             return v;
         }
     }
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .unwrap_or_default();
-    let mut v = Vec::new();
-    for sub in [
-        "pc-agent",
-        "hub",
-        "kb",
-        "hub_out",
-        "agent-xray",
-        "workspace",
-        "endoscope",
-    ] {
-        v.push(Path::new(&home).join(sub));
+    let mut v = vec![PathBuf::from(r"C:\remote")];
+    if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
+        if !home.is_empty() {
+            v.push(PathBuf::from(home));
+        }
     }
     v
+}
+
+fn exe_name(entry: &PROCESSENTRY32W) -> String {
+    let buf = &entry.szExeFile;
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    String::from_utf16_lossy(&buf[..len]).trim().to_string()
+}
+
+/// Имя образа, родитель и командная строка одного процесса.
+pub fn who(pid: u32) -> Who {
+    if pid == 0 {
+        return Who::unknown();
+    }
+    unsafe {
+        let (cmdline, ppid, image_full) = inspect(pid);
+        let image = {
+            let from_path = crate::feed::image_basename(&image_full);
+            if from_path.is_empty() {
+                crate::feed::image_basename(&cmdline)
+            } else {
+                from_path
+            }
+        };
+        let cmdline = if cmdline.is_empty() { image_full } else { cmdline };
+        Who::from_parts(pid, ppid, image, cmdline)
+    }
 }
 
 /// Полная командная строка процесса (аналог /proc/<pid>/cmdline).
 pub fn pid_cmdline(pid: u32) -> String {
     unsafe {
-        if let Some(cmd) = cmdline_from_peb(pid) {
-            if !cmd.trim().is_empty() {
-                return cmd;
-            }
+        let (cmdline, _, image_full) = inspect(pid);
+        if !cmdline.trim().is_empty() {
+            cmdline
+        } else {
+            image_full
         }
-        image_path(pid).unwrap_or_default()
     }
 }
 
-/// Читает командную строку из PEB процесса.
-unsafe fn cmdline_from_peb(pid: u32) -> Option<String> {
-    let h = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid);
+/// Командная строка, pid родителя и полный путь к образу — одним открытием процесса.
+unsafe fn inspect(pid: u32) -> (String, u32, String) {
+    let access = PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_QUERY_LIMITED_INFORMATION;
+    let h = OpenProcess(access, 0, pid);
     if h.is_null() {
-        return None;
+        return (String::new(), 0, String::new());
     }
-    let out = cmdline_from_handle(h);
+    let (cmdline, ppid) = cmdline_and_ppid(h);
+    let image = image_from_handle(h).unwrap_or_default();
     CloseHandle(h);
-    out
+    (cmdline.unwrap_or_default(), ppid, image)
 }
 
-unsafe fn cmdline_from_handle(h: HANDLE) -> Option<String> {
+unsafe fn cmdline_and_ppid(h: HANDLE) -> (Option<String>, u32) {
     let mut pbi: PROCESS_BASIC_INFORMATION = std::mem::zeroed();
     let status = NtQueryInformationProcess(
         h,
@@ -126,12 +145,13 @@ unsafe fn cmdline_from_handle(h: HANDLE) -> Option<String> {
         size_of::<PROCESS_BASIC_INFORMATION>() as u32,
         null_mut(),
     );
+    let ppid = pbi.InheritedFromUniqueProcessId as u32;
     if status != STATUS_SUCCESS {
-        return None;
+        return (None, ppid);
     }
     let peb = pbi.PebBaseAddress as usize;
     if peb == 0 {
-        return None;
+        return (None, ppid);
     }
     // PEB -> ProcessParameters
     let mut params: usize = 0;
@@ -141,10 +161,10 @@ unsafe fn cmdline_from_handle(h: HANDLE) -> Option<String> {
         &mut params as *mut usize as *mut u8,
         size_of::<usize>(),
     ) {
-        return None;
+        return (None, ppid);
     }
     if params == 0 {
-        return None;
+        return (None, ppid);
     }
     // ProcessParameters -> CommandLine (UNICODE_STRING)
     let mut us = UnicodeString { length: 0, maximum_length: 0, buffer: null_mut() };
@@ -154,21 +174,21 @@ unsafe fn cmdline_from_handle(h: HANDLE) -> Option<String> {
         &mut us as *mut UnicodeString as *mut u8,
         size_of::<UnicodeString>(),
     ) {
-        return None;
+        return (None, ppid);
     }
     if us.length == 0 || us.buffer.is_null() {
-        return None;
+        return (None, ppid);
     }
     let mut buf = vec![0u16; (us.length as usize / 2) + 1];
     if !read_mem(h, us.buffer as usize, buf.as_mut_ptr() as *mut u8, us.length as usize) {
-        return None;
+        return (None, ppid);
     }
     let s = String::from_utf16_lossy(&buf);
     let s = s.trim_end_matches('\0').trim().to_string();
     if s.is_empty() {
-        None
+        (None, ppid)
     } else {
-        Some(s)
+        (Some(s), ppid)
     }
 }
 
@@ -187,16 +207,10 @@ unsafe fn read_mem(h: HANDLE, addr: usize, buf: *mut u8, len: usize) -> bool {
     ok != 0 && read == len
 }
 
-/// Запасной путь: путь к исполняемому файлу.
-unsafe fn image_path(pid: u32) -> Option<String> {
-    let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-    if h.is_null() {
-        return None;
-    }
+unsafe fn image_from_handle(h: HANDLE) -> Option<String> {
     let mut size: u32 = 1024;
     let mut buf = vec![0u16; size as usize];
     let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut size);
-    CloseHandle(h);
     if ok == 0 {
         return None;
     }
@@ -210,6 +224,7 @@ unsafe fn image_path(pid: u32) -> Option<String> {
 }
 
 /// Глаз №1: каждый новый запуск в системе.
+/// Пустая командная строка не должна перескакивать `Process32NextW`.
 pub fn scan_procs(seen: &mut HashSet<u32>, journal: &mut Journal, recent: &mut VecDeque<Spawn>) {
     unsafe {
         let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -221,20 +236,22 @@ pub fn scan_procs(seen: &mut HashSet<u32>, journal: &mut Journal, recent: &mut V
         if Process32FirstW(snap, &mut entry) != 0 {
             loop {
                 let pid = entry.th32ProcessID;
-                if pid != 0 && !seen.contains(&pid) {
-                    seen.insert(pid);
-                    let cmd = pid_cmdline(pid);
-                    if cmd.is_empty() {
-                        continue;
+                if pid != 0 && seen.insert(pid) {
+                    let image = exe_name(&entry);
+                    let cmdline = pid_cmdline(pid);
+                    let who = Who::from_parts(pid, entry.th32ParentProcessID, image, cmdline);
+                    if !who.image.is_empty() || !who.cmdline.is_empty() {
+                        let detail: String = if who.cmdline.is_empty() {
+                            who.image.clone()
+                        } else {
+                            who.cmdline.chars().take(200).collect()
+                        };
+                        recent.push_back((now_ms(), pid, detail.clone(), who.class));
+                        while recent.len() > 100 {
+                            recent.pop_front();
+                        }
+                        record(journal, "spawn", &who, detail);
                     }
-                    let agent = classify(&cmd);
-                    let detail: String = cmd.chars().take(200).collect();
-                    recent.push_back((now_ms(), pid, detail.clone(), agent));
-                    while recent.len() > 100 {
-                        recent.pop_front();
-                    }
-                    let ev = Event::now("spawn", pid, agent, detail);
-                    let _ = journal.write_event(&ev);
                 }
                 if Process32NextW(snap, &mut entry) == 0 {
                     break;
@@ -245,16 +262,9 @@ pub fn scan_procs(seen: &mut HashSet<u32>, journal: &mut Journal, recent: &mut V
     }
 }
 
-/// IPv4 в сетевом порядке + порт (тоже в сетевом порядке) -> "1.2.3.4:8080".
+/// IPv4 из таблицы TCP: байты DWORD — сетевой порядок, не число big-endian.
 fn fmt_addr(ip: u32, port: u32) -> String {
-    format!(
-        "{}.{}.{}.{}:{}",
-        (ip >> 24) & 0xff,
-        (ip >> 16) & 0xff,
-        (ip >> 8) & 0xff,
-        ip & 0xff,
-        u16::from_be(port as u16)
-    )
+    crate::netaddr::format_ipv4_endpoint(ip, port as u16)
 }
 
 /// Глаз №2: живые сетевые соединения — кто с кем разговаривает.
@@ -299,10 +309,8 @@ pub fn scan_net(seen_conn: &mut HashSet<ConnKey>, journal: &mut Journal) {
             }
             seen_conn.insert(key);
             let detail = format!("-> {}", fmt_addr(row.remote_addr, row.remote_port));
-            let cmd = pid_cmdline(row.owning_pid);
-            let agent = classify(&cmd);
-            let ev = Event::now("connect", row.owning_pid, agent, detail);
-            let _ = journal.write_event(&ev);
+            let who = who(row.owning_pid);
+            record(journal, "connect", &who, detail);
         }
     }
 }
@@ -311,8 +319,100 @@ pub fn scan_net(seen_conn: &mut HashSet<ConnKey>, journal: &mut Journal) {
 /// На Windows это умеет Restart Manager (см. `super::win_owner`).
 /// Если процесс не найден, работает запасной след `correlate_recent`
 /// (недавний запуск в этой папке).
-pub fn attribute_open(path_str: &str) -> Option<(u32, &'static str)> {
+pub fn attribute_open(path_str: &str) -> Option<u32> {
     let (pid, _) = super::win_owner::find_open_handle(path_str)?;
-    let cmd = pid_cmdline(pid);
-    Some((pid, classify(&cmd)))
+    if pid == 0 {
+        None
+    } else {
+        Some(pid)
+    }
+}
+
+/// Живой кадр для XRAY. Не пишет журнал.
+pub fn snapshot_procs() -> Vec<ProcSnap> {
+    let mut out = Vec::new();
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return out;
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+        if Process32FirstW(snap, &mut entry) != 0 {
+            loop {
+                let pid = entry.th32ProcessID;
+                if pid != 0 {
+                    let image = exe_name(&entry);
+                    let cmdline = pid_cmdline(pid);
+                    let who = Who::from_parts(pid, entry.th32ParentProcessID, image, cmdline);
+                    if !who.image.is_empty() || !who.cmdline.is_empty() {
+                        let cmd = if who.cmdline.is_empty() {
+                            who.image.clone()
+                        } else {
+                            who.cmdline.chars().take(200).collect()
+                        };
+                        out.push(ProcSnap {
+                            pid,
+                            cmd,
+                            agent: who.class,
+                            image: who.image,
+                            ppid: who.ppid,
+                        });
+                    }
+                }
+                if Process32NextW(snap, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snap);
+    }
+    out
+}
+
+/// Слушающие TCP. Глаз №2 оставляет только ESTABLISHED.
+pub fn snapshot_listens() -> Vec<ListenSnap> {
+    let mut out = Vec::new();
+    unsafe {
+        let mut size: u32 = 0;
+        GetExtendedTcpTable(null_mut(), &mut size, 0, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
+        if size < 4 {
+            return out;
+        }
+        let mut buf = vec![0u8; size as usize];
+        let res = GetExtendedTcpTable(
+            buf.as_mut_ptr() as *mut c_void,
+            &mut size,
+            0,
+            AF_INET,
+            TCP_TABLE_OWNER_PID_ALL,
+            0,
+        );
+        if res != 0 {
+            return out;
+        }
+        let count = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        let row_size = size_of::<TcpRowOwnerPid>();
+        let mut seen = HashSet::new();
+        for i in 0..count {
+            let off = 4 + i * row_size;
+            if off + row_size > buf.len() {
+                break;
+            }
+            let row = std::ptr::read_unaligned(buf.as_ptr().add(off) as *const TcpRowOwnerPid);
+            if row.state != 2 {
+                continue;
+            }
+            let port = u16::from_be(row.local_port as u16) as u32;
+            if port == 0 || !seen.insert((row.owning_pid, port)) {
+                continue;
+            }
+            out.push(ListenSnap {
+                pid: row.owning_pid,
+                port,
+                local: fmt_addr(row.local_addr, row.local_port),
+            });
+        }
+    }
+    out
 }

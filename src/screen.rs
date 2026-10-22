@@ -68,6 +68,10 @@ pub fn start_screen(journal_path: String) {
             let first = req.lines().next().unwrap_or("").to_string();
             let (body, ctype) = if first.starts_with("GET /events") {
                 (events_json(&journal_path), "application/json")
+            } else if first.starts_with("GET /health") {
+                (health_json(&journal_path), "application/json")
+            } else if first.starts_with("GET /frame") {
+                (frame_json(&journal_path), "application/json")
             } else if first.starts_with("GET /check?path=") {
                 let raw = first.trim_start_matches("GET /check?path=");
                 let raw = raw.split(' ').next().unwrap_or("");
@@ -120,6 +124,57 @@ pub fn load_lines(journal_path: &str) -> Vec<String> {
         .map(|l| l.to_string())
         .filter(|l| !l.trim().is_empty() && !l.contains("\"heartbeat\""))
         .collect()
+}
+
+/// Какой глаз пишет журнал прямо сейчас.
+pub fn health_json(journal_path: &str) -> String {
+    serde_json::json!({
+        "ok": true,
+        "version": crate::version::VERSION,
+        "mode": crate::mode::name(),
+        "journal": journal_path,
+    })
+    .to_string()
+}
+
+/// Живой кадр: процессы и слушающие порты сейчас, плюс хвост журнала.
+/// Поля `pid`/`cmd`/`agent` у процесса — как в 0.8.1 (`agent` остаётся классом).
+/// Рядом добавлены `image` и `ppid`.
+pub fn frame_json(journal_path: &str) -> String {
+    let procs: Vec<serde_json::Value> = crate::plat::snapshot_procs()
+        .into_iter()
+        .map(|p| {
+            serde_json::json!({
+                "pid": p.pid,
+                "cmd": p.cmd,
+                "agent": p.agent,
+                "image": p.image,
+                "ppid": p.ppid,
+            })
+        })
+        .collect();
+    let listens: Vec<serde_json::Value> = crate::plat::snapshot_listens()
+        .into_iter()
+        .map(|l| {
+            serde_json::json!({
+                "pid": l.pid,
+                "port": l.port,
+                "local": l.local,
+            })
+        })
+        .collect();
+    let events: serde_json::Value =
+        serde_json::from_str(&events_json(journal_path)).unwrap_or(serde_json::json!([]));
+    serde_json::json!({
+        "ok": true,
+        "version": crate::version::VERSION,
+        "mode": crate::mode::name(),
+        "journal": journal_path,
+        "procs": procs,
+        "listens": listens,
+        "events": events,
+    })
+    .to_string()
 }
 
 /// Последние 100 фактов журнала — свежие сверху, готовым JSON-массивом.
@@ -261,12 +316,12 @@ pub const PAGE: &str = r#"<!DOCTYPE html>
  th{position:sticky;top:0;background:#161b22;text-align:left;padding:8px;color:#8b949e}
  td{padding:6px 8px;border-top:1px solid #21262d;word-break:break-all}
  .spawn{color:#58a6ff}.connect{color:#3fb950}.file_create{color:#d29922}
- .file_write{color:#e3b341}.file_delete{color:#f85149}
+ .file_write{color:#e3b341}.file_delete{color:#f85149}.exit{color:#8b949e}
  .agent{color:#bc8cff}.time{color:#8b949e;white-space:nowrap}
  #wrap{max-width:1100px;margin:0 auto}
 </style></head><body><div id="wrap">
 <h1><span class="dot"></span>ЭНДОСКОП — живая правда</h1>
-<div class="sub">Что реально делали процессы и агенты. Лента обновляется каждые 2 секунды.</div>
+<div class="sub">Что реально делали процессы и агенты. Лента обновляется каждые 2 секунды. <span id="mode"></span></div>
 <div><input id="q" placeholder="введи путь к файлу — проверить, трогали ли его">
 <button onclick="check()">ПРОВЕРИТЬ</button></div>
 <div id="verdict"></div>
@@ -282,10 +337,13 @@ pub const PAGE: &str = r#"<!DOCTYPE html>
 <script>
 function fmt(ts){const d=new Date(ts);return d.toLocaleTimeString('ru-RU')}
 function esc(s){const d=document.createElement('div');d.textContent=s||'';return d.innerHTML}
-const RU={spawn:'запуск',connect:'связь',file_create:'файл создан',file_write:'файл переписан',file_delete:'файл удалён'};
-function row(e){return '<tr><td class="time">'+fmt(e.ts)+'</td><td class="'+e.kind+'">'+(RU[e.kind]||e.kind)+'</td><td class="agent">'+esc(e.agent)+' #'+e.pid+'</td><td>'+esc(e.detail)+'</td></tr>'}
+const RU={spawn:'запуск',exit:'выход',connect:'связь',file_create:'файл создан',file_write:'файл переписан',file_delete:'файл удалён'};
+function who(e){const name=e.image||e.agent||'';const parent=e.ppid?(' ppid '+e.ppid):'';return esc(name)+' #'+(e.pid||0)+parent}
+function row(e){return '<tr><td class="time">'+fmt(e.ts)+'</td><td class="'+e.kind+'">'+(RU[e.kind]||e.kind)+'</td><td class="agent">'+who(e)+'</td><td>'+esc(e.detail)+'</td></tr>'}
 async function tick(){
  try{
+  const h=await fetch('/health');const d=await h.json();
+  document.getElementById('mode').textContent='режим: '+(d.mode||'');
   const r=await fetch('/events');const evs=await r.json();
   document.getElementById('rows').innerHTML=evs.map(row).join('');
  }catch(e){}

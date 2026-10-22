@@ -5,9 +5,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 
-use crate::journal::{now_ms, Event, Journal};
+use crate::journal::{now_ms, Journal};
 
-use super::{classify, ConnKey, Spawn};
+use super::{record, ConnKey, ListenSnap, ProcSnap, Spawn, Who};
 
 /// Какие папки смотрим. Перекрывается переменной ENDOSCOPE_WATCH_DIRS
 /// (список через двоеточие) — так же, как на Windows.
@@ -39,6 +39,36 @@ pub fn pid_cmdline(pid: u32) -> String {
         .to_string()
 }
 
+fn comm_of(pid: u32) -> String {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+fn ppid_of(pid: u32) -> u32 {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+    let Some(rest) = text.rsplit_once(')').map(|(_, tail)| tail) else {
+        return 0;
+    };
+    rest.split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+pub fn who(pid: u32) -> Who {
+    if pid == 0 {
+        return Who::unknown();
+    }
+    let cmdline = pid_cmdline(pid);
+    let mut image = comm_of(pid);
+    if image.is_empty() {
+        image = crate::feed::image_basename(&cmdline);
+    }
+    Who::from_parts(pid, ppid_of(pid), image, cmdline)
+}
+
 /// Глаз №1: каждый новый запуск в системе.
 pub fn scan_procs(seen: &mut HashSet<u32>, journal: &mut Journal, recent: &mut VecDeque<Spawn>) {
     if let Ok(entries) = std::fs::read_dir("/proc") {
@@ -55,17 +85,20 @@ pub fn scan_procs(seen: &mut HashSet<u32>, journal: &mut Journal, recent: &mut V
                 continue;
             }
             seen.insert(pid);
-            let cmd = pid_cmdline(pid);
-            if cmd.is_empty() {
+            let who = who(pid);
+            if who.cmdline.is_empty() && who.image.is_empty() {
                 continue;
             }
-            let agent = classify(&cmd);
-            recent.push_back((now_ms(), pid, cmd.chars().take(200).collect(), agent));
+            let detail: String = if who.cmdline.is_empty() {
+                who.image.clone()
+            } else {
+                who.cmdline.chars().take(200).collect()
+            };
+            recent.push_back((now_ms(), pid, detail.clone(), who.class));
             while recent.len() > 100 {
                 recent.pop_front();
             }
-            let ev = Event::now("spawn", pid, agent, cmd.chars().take(200).collect());
-            let _ = journal.write_event(&ev);
+            record(journal, "spawn", &who, detail);
         }
     }
 }
@@ -135,16 +168,14 @@ pub fn scan_net(seen_conn: &mut HashSet<ConnKey>, journal: &mut Journal) {
             }
             seen_conn.insert(key);
             let detail = format!("-> {}", decode_addr(cols[2]));
-            let cmd = pid_cmdline(pid);
-            let agent = classify(&cmd);
-            let ev = Event::now("connect", pid, agent, detail);
-            let _ = journal.write_event(&ev);
+            let who = who(pid);
+            record(journal, "connect", &who, detail);
         }
     }
 }
 
 /// КТО виновник: ищем живой процесс, у которого этот файл открыт прямо сейчас.
-pub fn attribute_open(path_str: &str) -> Option<(u32, &'static str)> {
+pub fn attribute_open(path_str: &str) -> Option<u32> {
     if let Ok(entries) = std::fs::read_dir("/proc") {
         for e in entries.flatten() {
             let name = match e.file_name().to_str() {
@@ -159,8 +190,7 @@ pub fn attribute_open(path_str: &str) -> Option<(u32, &'static str)> {
                 for fd in fds.flatten() {
                     if let Ok(link) = fd.path().read_link() {
                         if link.to_string_lossy() == path_str {
-                            let cmd = pid_cmdline(pid);
-                            return Some((pid, classify(&cmd)));
+                            return Some(pid);
                         }
                     }
                 }
@@ -168,4 +198,86 @@ pub fn attribute_open(path_str: &str) -> Option<(u32, &'static str)> {
         }
     }
     None
+}
+
+/// Живой кадр для XRAY: все процессы сейчас, без записи в журнал.
+pub fn snapshot_procs() -> Vec<ProcSnap> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for e in entries.flatten() {
+            let Ok(name) = e.file_name().into_string() else { continue };
+            let Ok(pid) = name.parse::<u32>() else { continue };
+            let who = who(pid);
+            if who.cmdline.is_empty() && who.image.is_empty() {
+                continue;
+            }
+            let cmd = if who.cmdline.is_empty() {
+                who.image.clone()
+            } else {
+                who.cmdline.chars().take(200).collect()
+            };
+            out.push(ProcSnap {
+                pid,
+                cmd,
+                agent: who.class,
+                image: who.image,
+                ppid: who.ppid,
+            });
+        }
+    }
+    out
+}
+
+fn port_of(hex: &str) -> u32 {
+    let Some((_, port)) = hex.rsplit_once(':') else { return 0 };
+    u32::from_str_radix(port, 16).unwrap_or(0)
+}
+
+fn socket_owners() -> HashMap<u64, u32> {
+    let mut inode_pid = HashMap::new();
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for e in entries.flatten() {
+            let Ok(name) = e.file_name().into_string() else { continue };
+            let Ok(pid) = name.parse::<u32>() else { continue };
+            let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else { continue };
+            for fd in fds.flatten() {
+                let Ok(link) = fd.path().read_link() else { continue };
+                let s = link.to_string_lossy();
+                let Some(rest) = s.strip_prefix("socket:[") else { continue };
+                if let Ok(ino) = rest.trim_end_matches(']').parse::<u64>() {
+                    inode_pid.insert(ino, pid);
+                }
+            }
+        }
+    }
+    inode_pid
+}
+
+/// Слушающие порты. Глаз №2 пишет только ESTABLISHED, кадру нужны LISTEN.
+pub fn snapshot_listens() -> Vec<ListenSnap> {
+    let owners = socket_owners();
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for file in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(text) = std::fs::read_to_string(file) else { continue };
+        for line in text.lines().skip(1) {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            if cols.len() < 10 || cols[3] != "0A" {
+                continue;
+            }
+            let Ok(inode) = cols[9].parse::<u64>() else { continue };
+            let pid = owners.get(&inode).copied().unwrap_or(0);
+            let port = port_of(cols[1]);
+            if port == 0 || !seen.insert((pid, port)) {
+                continue;
+            }
+            let local = if cols[1].split(':').next().map(|s| s.len()).unwrap_or(0) > 8 {
+                format!("*:{port}")
+            } else {
+                decode_addr(cols[1])
+            };
+            out.push(ListenSnap { pid, port, local });
+        }
+    }
+    out
 }
