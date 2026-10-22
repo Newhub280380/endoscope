@@ -1,19 +1,26 @@
 //! Эндоскоп — рентген-камера для ИИ-агентов. Продукт №1 рембазы.
+//! v0.10: самописец, тройное подтверждение падения, предвестники.
 //! v0.9: на Windows живой глаз — ETW (процессы, файлы, сеть). Опрос
 //!       (toolhelp32 + iphlpapi + mtime) остаётся, если сессию ядра
 //!       поднять нельзя. На Linux по-прежнему только `/proc`.
 
+mod chain;
+mod codes;
+mod fdir;
 mod feed;
 mod journal;
 mod mode;
 mod netaddr;
 mod plat;
+mod precursor;
 mod screen;
 mod version;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::Duration;
+
+use fdir::Tick;
 
 use journal::Journal;
 use plat::{ConnKey, Spawn};
@@ -27,6 +34,8 @@ fn main() -> std::io::Result<()> {
     let mut file_state: HashMap<PathBuf, (u64, u64)> = HashMap::new();
     let mut recent: VecDeque<Spawn> = VecDeque::new();
     let watch = plat::watch_dirs();
+    journal.set_watch_roots(&watch);
+    journal.set_self_pid(std::process::id());
 
     screen::start_screen(journal_path.clone());
 
@@ -51,8 +60,9 @@ fn main() -> std::io::Result<()> {
         mode::set_etw();
         banner(&journal_path, &watch);
         need_baseline = false;
-        run_etw(src, &mut seen, &mut journal, &mut recent)?;
+        run_etw(src, &mut seen, &mut journal, &mut recent, &watch)?;
         println!("ETW оборвался — перехожу на опрос.");
+        let _ = journal.sensor_lost();
     }
 
     mode::set_poll();
@@ -83,7 +93,7 @@ fn main() -> std::io::Result<()> {
 
 fn banner(journal_path: &str, watch: &[PathBuf]) {
     println!(
-        "Эндоскоп v{} запущен. режим={}, pid={}, журнал={}, экран=http://127.0.0.1:7095/ , здоровье=http://127.0.0.1:7095/health",
+        "Эндоскоп v{} запущен. режим={}, pid={}, журнал={}, экран=http://127.0.0.1:7095/ , здоровье=http://127.0.0.1:7095/health , проверка=http://127.0.0.1:7095/verify",
         version::VERSION,
         mode::name(),
         std::process::id(),
@@ -118,6 +128,7 @@ fn run_poll(
         plat::scan_procs(seen, journal, recent);
         plat::scan_net(seen_conn, journal);
         plat::scan_files(file_state, journal, recent, watch);
+        watch_tick(journal, watch)?;
         beat(journal, &mut marked, 0)?;
         std::thread::sleep(Duration::from_secs(5));
     }
@@ -129,6 +140,7 @@ fn run_etw(
     seen: &mut HashSet<u32>,
     journal: &mut Journal,
     recent: &mut VecDeque<Spawn>,
+    watch: &[PathBuf],
 ) -> std::io::Result<()> {
     use std::sync::atomic::Ordering;
 
@@ -147,6 +159,7 @@ fn run_etw(
         let now = journal::now_ms();
         if now.saturating_sub(last_beat) >= 5_000 {
             let dropped = src.dropped.load(Ordering::Relaxed) + dedup.dropped;
+            watch_tick(journal, watch)?;
             beat(journal, &mut marked, dropped)?;
             last_beat = now;
         }
@@ -192,6 +205,31 @@ fn apply_live(
         class: live.class,
     };
     plat::record(journal, live.kind, &who, live.detail.clone());
+}
+
+fn watch_tick(journal: &mut Journal, watch: &[PathBuf]) -> std::io::Result<()> {
+    let now = journal::now_ms();
+    let alive = plat::alive_pids();
+    let armed = journal.armed_pids();
+    let links = plat::link_pids(&armed);
+    let due = journal.due_pids(now, &alive);
+    let mut probes = HashMap::new();
+    for pid in due {
+        if let Some(probe) = plat::probe_pid(pid) {
+            probes.insert(pid, probe);
+        }
+    }
+    let dirs: Vec<fdir::DirObs> = watch.iter().map(|p| plat::observe_dir(p)).collect();
+    let disk = watch.first().and_then(|p| plat::disk_free_mb(p));
+    journal.tick_watch(&Tick {
+        now,
+        alive: &alive,
+        links: &links,
+        probes: &probes,
+        dirs: &dirs,
+        disk_free_mb: disk,
+        self_pid: std::process::id(),
+    })
 }
 
 fn beat(journal: &mut Journal, marked: &mut u64, dropped: u64) -> std::io::Result<()> {

@@ -281,3 +281,84 @@ pub fn snapshot_listens() -> Vec<ListenSnap> {
     }
     out
 }
+
+pub fn alive_pids() -> HashSet<u32> {
+    let mut out = HashSet::new();
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for e in entries.flatten() {
+            if let Ok(name) = e.file_name().into_string() {
+                if let Ok(pid) = name.parse::<u32>() {
+                    out.insert(pid);
+                }
+            }
+        }
+    }
+    out
+}
+
+pub fn link_pids(watch: &[u32]) -> HashSet<u32> {
+    let mut out = HashSet::new();
+    for pid in watch {
+        if pid_has_socket(*pid) {
+            out.insert(*pid);
+        }
+    }
+    out
+}
+
+fn pid_has_socket(pid: u32) -> bool {
+    let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return false;
+    };
+    for fd in fds.flatten() {
+        if let Ok(link) = fd.path().read_link() {
+            if link.to_string_lossy().starts_with("socket:") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub fn probe_pid(pid: u32) -> Option<crate::precursor::Probe> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let mut rss = None;
+    let mut threads = None;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            rss = rest.split_whitespace().next().and_then(|s| s.parse().ok());
+        } else if let Some(rest) = line.strip_prefix("Threads:") {
+            threads = rest.split_whitespace().next().and_then(|s| s.parse().ok());
+        }
+    }
+    Some(crate::precursor::Probe {
+        rss_kb: rss,
+        handles: fd_count(pid),
+        threads,
+        cpu_ms: stat_cpu_ms(pid),
+    })
+}
+
+fn fd_count(pid: u32) -> Option<u64> {
+    let fds = std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
+    Some(fds.flatten().count() as u64)
+}
+
+fn stat_cpu_ms(pid: u32) -> Option<u64> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = text.rsplit_once(')')?.1;
+    let cols: Vec<&str> = rest.split_whitespace().collect();
+    let utime: u64 = cols.get(11)?.parse().ok()?;
+    let stime: u64 = cols.get(12)?.parse().ok()?;
+    Some((utime.saturating_add(stime)).saturating_mul(1000) / 100)
+}
+
+pub fn disk_free_mb(path: &std::path::Path) -> Option<u64> {
+    let text = path.to_string_lossy();
+    let c = std::ffi::CString::new(text.as_ref()).ok()?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    Some(st.f_bavail as u64 * st.f_frsize as u64 / (1024 * 1024))
+}

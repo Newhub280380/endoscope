@@ -145,6 +145,27 @@ fn noise_body(s: &str) -> bool {
         || s.ends_with("/ntuser.dat.log")
 }
 
+/// Корень наблюдения, под который попал путь. `None` — путь вне списка.
+pub fn watch_root(path: &str, dirs: &[PathBuf]) -> Option<String> {
+    if path.is_empty() {
+        return None;
+    }
+    let norm = path.replace('/', "\\").to_lowercase();
+    for dir in dirs {
+        let mut root = dir.to_string_lossy().replace('/', "\\").to_lowercase();
+        while root.ends_with('\\') {
+            root.pop();
+        }
+        if root.is_empty() {
+            continue;
+        }
+        if norm == root || norm.starts_with(&format!("{root}\\")) {
+            return Some(dir.display().to_string());
+        }
+    }
+    None
+}
+
 pub fn is_watched(path: &str, dirs: &[PathBuf]) -> bool {
     if path.is_empty() || looks_like_dir(path) || is_noise_path(path) {
         return false;

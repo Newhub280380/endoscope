@@ -1,11 +1,18 @@
 [package]
 name = "endoscope"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "=0.10.8"
+# Версии зафиксированы под rustc 1.83: более новые zeroize/base64ct
+# объявляют edition2024 и не разбираются этим Cargo.
+ed25519-dalek = { version = "=2.1.1", default-features = false, features = ["std", "fast", "zeroize"] }
+getrandom = "=0.2.15"
+zeroize = "=1.8.1"
+base64ct = "=1.6.0"
 
 # Windows-глаза: toolhelp32 (процессы), iphlpapi (сеть), PEB (командная строка).
 # На Linux пакет не нужен — там /proc.
@@ -23,6 +30,9 @@ windows-sys = { version = "0.59", features = [
     "Wdk_System_Threading",
 ] }
 ferrisetw = "1.2.0"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [profile.release]
 opt-level = 2
