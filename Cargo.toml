@@ -1,6 +1,6 @@
 [package]
 name = "endoscope"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 
 [dependencies]
@@ -22,6 +22,7 @@ windows-sys = { version = "0.59", features = [
     "Wdk_System_SystemInformation",
     "Wdk_System_Threading",
 ] }
+ferrisetw = "1.2.0"
 
 [profile.release]
 opt-level = 2

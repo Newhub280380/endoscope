@@ -13,6 +13,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Тесты
+        run: cargo test
       - name: Сборка (MSVC, x64)
         run: cargo build --release
       - uses: actions/upload-artifact@v4
@@ -62,6 +64,14 @@ jobs:
             if ($spawns -lt 1) { throw "в ленте нет ни одного запуска процесса" }
             Write-Host "OK   лента: $spawns запусков процессов, всего фактов $($evs.Count)"
 
+            # 3b) режим и живой кадр. На раннере ETW может подняться (админ) или нет.
+            $h = Invoke-RestMethod -Uri "http://127.0.0.1:7095/health" -TimeoutSec 10
+            if ($h.mode -ne "etw" -and $h.mode -ne "poll") { throw "непонятный режим: $($h.mode)" }
+            Write-Host "OK   режим $($h.mode)"
+            $frame = Invoke-RestMethod -Uri "http://127.0.0.1:7095/frame" -TimeoutSec 20
+            if (-not $frame.procs -or @($frame.procs).Count -lt 1) { throw "кадр /frame без процессов" }
+            Write-Host "OK   кадр: $(@($frame.procs).Count) процессов"
+
             # 4) ждём, пока эндоскоп увидит файл в зоне наблюдения
             $touched = $false
             for ($i = 0; $i -lt 20; $i++) {
@@ -107,6 +117,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Тесты
+        run: cargo test
       - name: Сборка (Linux)
         run: cargo build --release
       - uses: actions/upload-artifact@v4
@@ -132,6 +144,10 @@ jobs:
           echo "OK   страница «кино» на месте"
           curl -sf http://127.0.0.1:7095/events | grep -q '"kind":"spawn"' || { echo "в ленте нет запусков"; exit 1; }
           echo "OK   лента живых фактов работает"
+          curl -sf http://127.0.0.1:7095/health | grep -q '"mode":"poll"' || { echo "на Linux режим должен быть poll"; exit 1; }
+          echo "OK   режим poll"
+          curl -sf http://127.0.0.1:7095/frame | grep -q '"procs"' || { echo "кадр /frame без процессов"; exit 1; }
+          echo "OK   кадр /frame"
           for i in $(seq 1 20); do
             sleep 1
             t=$(curl -sf "http://127.0.0.1:7095/check?path=$PWD/ci-evidence/watch/секрет.txt" | grep -o '"touched":[0-9]*' | cut -d: -f2)
