@@ -71,6 +71,15 @@ jobs:
             $frame = Invoke-RestMethod -Uri "http://127.0.0.1:7095/frame" -TimeoutSec 20
             if (-not $frame.procs -or @($frame.procs).Count -lt 1) { throw "кадр /frame без процессов" }
             Write-Host "OK   кадр: $(@($frame.procs).Count) процессов"
+            $ver = Invoke-RestMethod -Uri "http://127.0.0.1:7095/verify" -TimeoutSec 10
+            if (-not $ver.ok) { throw "цепочка журнала: $($ver.reason)" }
+            Write-Host "OK   /verify цепочка цела"
+            $codes = Invoke-RestMethod -Uri "http://127.0.0.1:7095/codes" -TimeoutSec 10
+            if (-not $codes.catalog) { throw "каталог /codes пуст" }
+            Write-Host "OK   /codes"
+            $pre = Invoke-RestMethod -Uri "http://127.0.0.1:7095/precursors" -TimeoutSec 10
+            if ($null -eq $pre.precursors) { throw "/precursors без списка" }
+            Write-Host "OK   /precursors"
 
             # 4) ждём, пока эндоскоп увидит файл в зоне наблюдения
             $touched = $false
@@ -148,6 +157,12 @@ jobs:
           echo "OK   режим poll"
           curl -sf http://127.0.0.1:7095/frame | grep -q '"procs"' || { echo "кадр /frame без процессов"; exit 1; }
           echo "OK   кадр /frame"
+          curl -sf http://127.0.0.1:7095/verify | grep -q '"ok":true' || { echo "цепочка /verify не сошлась"; exit 1; }
+          echo "OK   /verify"
+          curl -sf http://127.0.0.1:7095/codes | grep -q '"catalog"' || { echo "каталог /codes пуст"; exit 1; }
+          echo "OK   /codes"
+          curl -sf http://127.0.0.1:7095/precursors | grep -q '"precursors"' || { echo "/precursors не ответил"; exit 1; }
+          echo "OK   /precursors"
           for i in $(seq 1 20); do
             sleep 1
             t=$(curl -sf "http://127.0.0.1:7095/check?path=$PWD/ci-evidence/watch/секрет.txt" | grep -o '"touched":[0-9]*' | cut -d: -f2)

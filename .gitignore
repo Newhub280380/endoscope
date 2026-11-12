@@ -1,2 +1,4 @@
 target/
 *.jsonl
+*.sig
+endoscope.key

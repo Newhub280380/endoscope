@@ -76,6 +76,12 @@ pub fn start_screen(journal_path: String) {
                 let raw = first.trim_start_matches("GET /check?path=");
                 let raw = raw.split(' ').next().unwrap_or("");
                 (check_json(&journal_path, &url_decode(raw)), "application/json")
+            } else if first.starts_with("GET /verify") {
+                (verify_json(&journal_path), "application/json")
+            } else if first.starts_with("GET /codes") {
+                (codes_json(&journal_path), "application/json")
+            } else if first.starts_with("GET /precursors") {
+                (precursors_json(&journal_path), "application/json")
             } else if first.starts_with("GET /lie?claim=") {
                 let raw = first.trim_start_matches("GET /lie?claim=");
                 let raw = raw.split(' ').next().unwrap_or("");
@@ -124,6 +130,91 @@ pub fn load_lines(journal_path: &str) -> Vec<String> {
         .map(|l| l.to_string())
         .filter(|l| !l.trim().is_empty() && !l.contains("\"heartbeat\""))
         .collect()
+}
+
+pub fn verify_json(journal_path: &str) -> String {
+    let report = crate::chain::verify(
+        std::path::Path::new(journal_path),
+        &crate::chain::default_key_path(),
+    );
+    serde_json::json!({
+        "ok": report.ok,
+        "legacy": report.legacy,
+        "chained": report.chained,
+        "head": report.head,
+        "signed": report.signed,
+        "freezes": report.freezes,
+        "reason": report.reason,
+    })
+    .to_string()
+}
+
+pub fn codes_json(journal_path: &str) -> String {
+    let mut active: Vec<serde_json::Value> = Vec::new();
+    let mut index: std::collections::HashMap<(String, u32), usize> = std::collections::HashMap::new();
+    for line in load_lines(journal_path) {
+        let Ok(ev) = serde_json::from_str::<crate::journal::Event>(&line) else {
+            continue;
+        };
+        if ev.code.is_empty() {
+            continue;
+        }
+        let key = (ev.code.clone(), ev.pid);
+        let row = serde_json::json!({
+            "code": ev.code,
+            "title": crate::codes::title(&ev.code),
+            "status": ev.status,
+            "pid": ev.pid,
+            "ts": ev.ts,
+            "agent": ev.agent,
+            "votes": ev.votes,
+            "freeze": ev.freeze,
+            "detail": ev.detail,
+        });
+        if let Some(slot) = index.get(&key) {
+            let prev = active[*slot]["status"].as_str().unwrap_or("");
+            let merged = crate::codes::merge_status(prev, &ev.status);
+            active[*slot] = row;
+            active[*slot]["status"] = serde_json::Value::String(merged);
+        } else {
+            index.insert(key, active.len());
+            active.push(row);
+        }
+    }
+    let catalog: Vec<serde_json::Value> = crate::codes::CATALOG
+        .iter()
+        .map(|c| serde_json::json!({"code": c.code, "title": c.title}))
+        .collect();
+    serde_json::json!({"ok": true, "catalog": catalog, "active": active}).to_string()
+}
+
+pub fn precursors_json(journal_path: &str) -> String {
+    let mut latest: Vec<serde_json::Value> = Vec::new();
+    let mut index: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    for line in load_lines(journal_path) {
+        let Ok(ev) = serde_json::from_str::<crate::journal::Event>(&line) else {
+            continue;
+        };
+        if ev.kind != "precursor" {
+            continue;
+        }
+        let row = serde_json::json!({
+            "ts": ev.ts,
+            "pid": ev.pid,
+            "agent": ev.agent,
+            "level": ev.level,
+            "ttf_s": ev.ttf_s,
+            "indicators": ev.indicators,
+            "detail": ev.detail,
+        });
+        if let Some(slot) = index.get(&ev.pid) {
+            latest[*slot] = row;
+        } else {
+            index.insert(ev.pid, latest.len());
+            latest.push(row);
+        }
+    }
+    serde_json::json!({"ok": true, "precursors": latest}).to_string()
 }
 
 /// Какой глаз пишет журнал прямо сейчас.

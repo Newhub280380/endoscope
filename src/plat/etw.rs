@@ -386,7 +386,11 @@ fn on_process(shared: &Shared, record: &EventRecord, locator: &SchemaLocator) {
     }
     let kind = if stop { "exit" } else { "spawn" };
     let detail = if stop {
-        if info.image.is_empty() { "exit".into() } else { info.image.clone() }
+        let image = if info.image.is_empty() { "exit".into() } else { info.image.clone() };
+        match prop_u32(&parser, &["ExitStatus", "ExitCode"]) {
+            Some(code) => format!("exit={code} {image}"),
+            None => image,
+        }
     } else if !info.cmdline.is_empty() {
         info.cmdline.chars().take(200).collect()
     } else if !image_raw.is_empty() {
